@@ -103,6 +103,7 @@ pub struct AISettings {
     pub model: String,
     pub local_only: bool,
     pub fallback_to_local: bool,
+    pub lmstudio_url: Option<String>,
 }
 
 impl Default for AISettings {
@@ -115,6 +116,7 @@ impl Default for AISettings {
             model: "moonshotai/kimi-k2-instruct-0905".to_string(),
             local_only: false,
             fallback_to_local: true,
+            lmstudio_url: None,
         }
     }
 }

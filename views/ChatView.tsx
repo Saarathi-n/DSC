@@ -1,5 +1,5 @@
 import React from 'react';
-import { ChatPage } from '../intent-flow-main/src/components/Chat/ChatPage';
+import { ChatPage } from '../components/chat/ChatPage';
 
 export const ChatView: React.FC = () => {
   const initialPrompt = sessionStorage.getItem('chat_initial_prompt') || undefined;

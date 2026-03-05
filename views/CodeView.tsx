@@ -539,6 +539,8 @@ const SplitWorkspace: React.FC<WorkspaceProps> = ({ problem, onBack, onNotify })
   const [aiResponse, setAiResponse] = useState<AiResponse | null>(null);
   const [selectedModel, setSelectedModel] = useState(() => localStorage.getItem(CODE_LAST_MODEL_STORAGE_KEY) || DEFAULT_NIM_MODEL);
   const [availableModels, setAvailableModels] = useState<{ id: string }[]>([]);
+  const aiProvider = (settings?.aiProvider || 'nvidia').toLowerCase();
+  const isLocalProvider = aiProvider === 'local' || aiProvider === 'lmstudio';
   const nvidiaApiKey = settings?.nvidiaApiKey || '';
   const [showModelDropdown, setShowModelDropdown] = useState(false);
   const [modelSearchQuery, setModelSearchQuery] = useState('');
@@ -570,6 +572,23 @@ const SplitWorkspace: React.FC<WorkspaceProps> = ({ problem, onBack, onNotify })
     const fetchModels = async () => {
       try {
         const lastModel = localStorage.getItem(CODE_LAST_MODEL_STORAGE_KEY) || settings?.defaultModel || DEFAULT_NIM_MODEL;
+
+        if (isLocalProvider) {
+          const modelsRaw = await window.nexusAPI?.settings?.getLMStudioModels?.();
+          const normalized = (Array.isArray(modelsRaw) ? modelsRaw : [])
+            .map((m: any) => ({ id: m?.id || String(m) }))
+            .filter((m: { id: string }) => !!m.id);
+
+          if (normalized.length > 0) {
+            setAvailableModels(normalized);
+            const hasLastModel = normalized.some((m: { id: string }) => m.id === lastModel);
+            setSelectedModel(hasLastModel ? lastModel : normalized[0].id);
+          } else {
+            setAvailableModels([{ id: lastModel }]);
+            setSelectedModel(lastModel);
+          }
+          return;
+        }
 
         if (!nvidiaApiKey) {
           setAvailableModels([{ id: DEFAULT_NIM_MODEL }]);
@@ -607,7 +626,7 @@ const SplitWorkspace: React.FC<WorkspaceProps> = ({ problem, onBack, onNotify })
       }
     };
     fetchModels();
-  }, [nvidiaApiKey]); // Re-fetch only when key changes
+  }, [nvidiaApiKey, settings?.defaultModel, isLocalProvider]);
 
   useEffect(() => {
     if (!selectedModel?.trim()) return;
@@ -838,9 +857,9 @@ const SplitWorkspace: React.FC<WorkspaceProps> = ({ problem, onBack, onNotify })
     setIsAiLoading(true);
     setAiResponse(null);
 
-    if (!nvidiaApiKey) {
+    if (!isLocalProvider && !nvidiaApiKey) {
       setAiResponse({
-        explanation: 'NVIDIA API key is not configured. Add it in Settings → API Keys.',
+        explanation: 'NVIDIA API key is not configured. Add it in Settings → API Keys, or switch provider to local LM Studio.',
         code: '',
         pattern: ''
       });
@@ -866,6 +885,43 @@ Your response must be ONLY valid JSON. Do not include any text before or after t
         : fallbackModel;
 
       const callModel = async (modelId: string) => {
+        if (isLocalProvider) {
+          if (window.nexusAPI?.settings?.lmstudioChatCompletion) {
+            return await window.nexusAPI.settings.lmstudioChatCompletion(
+              modelId,
+              [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userMessage }
+              ],
+              1024,
+              0.2,
+            );
+          }
+
+          const response = await fetch('http://127.0.0.1:1234/v1/chat/completions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: modelId,
+              messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userMessage }
+              ],
+              stream: false,
+              max_tokens: 1024,
+              temperature: 0.2,
+            }),
+            signal: abortControllerRef.current?.signal
+          });
+
+          if (!response.ok) {
+            const errorText = await response.text().catch(() => 'Unknown API error');
+            throw new Error(`Local API error (${response.status}) on ${modelId}: ${errorText.slice(0, 220)}`);
+          }
+
+          return response.json();
+        }
+
         if (window.nexusAPI?.settings?.nvidiaChatCompletion) {
           return await window.nexusAPI.settings.nvidiaChatCompletion(
             modelId,

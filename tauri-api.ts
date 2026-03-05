@@ -135,9 +135,10 @@ export function initNexusApi() {
         sessionId: string,
         message: string,
         model?: string,
+        provider?: string,
         timeRange?: string,
         sources?: string[]
-      ) => invoke<any>('send_chat_message', { sessionId, message, model, timeRange, sources }),
+      ) => invoke<any>('send_chat_message', { sessionId, message, model, provider, timeRange, sources }),
       startActivityTracker: () => invoke<boolean>('start_activity_tracker'),
       getDashboardOverview: (refresh?: boolean) => invoke<any>('dashboard_get_overview', { refresh }),
       refreshDashboardOverview: () => invoke<any>('dashboard_refresh_overview'),
@@ -161,12 +162,20 @@ export function initNexusApi() {
       validateApiKey: (provider: string, apiKey?: string) =>
         invoke<{ valid: boolean; provider: string; message: string }>('settings_validate_api_key', { provider, apiKey }),
       getNvidiaModels: (apiKey?: string) => invoke<any[]>('settings_get_nvidia_models', { apiKey }),
+      getLMStudioModels: (baseUrl?: string) => invoke<any[]>('settings_get_lmstudio_models', { baseUrl }),
       nvidiaChatCompletion: (
         model: string,
         messages: { role: string; content: string }[],
         maxTokens?: number,
         temperature?: number,
       ) => invoke<any>('settings_nvidia_chat_completion', { model, messages, maxTokens, temperature }),
+      lmstudioChatCompletion: (
+        model: string,
+        messages: { role: string; content: string }[],
+        maxTokens?: number,
+        temperature?: number,
+        baseUrl?: string,
+      ) => invoke<any>('settings_lmstudio_chat_completion', { model, messages, maxTokens, temperature, baseUrl }),
     },
     storage: {
       getStats: () => invoke<any>('storage_get_stats'),
@@ -238,7 +247,7 @@ declare global {
         createChatSession: () => Promise<any>;
         deleteChatSession: (sessionId: string) => Promise<boolean>;
         getChatMessages: (sessionId: string) => Promise<any[]>;
-        sendChatMessage: (sessionId: string, message: string, model?: string, timeRange?: string, sources?: string[]) => Promise<any>;
+        sendChatMessage: (sessionId: string, message: string, model?: string, provider?: string, timeRange?: string, sources?: string[]) => Promise<any>;
         startActivityTracker: () => Promise<boolean>;
 
         getDashboardOverview: (refresh?: boolean) => Promise<any>;
@@ -260,11 +269,19 @@ declare global {
         save: (settings: any) => Promise<boolean>;
         validateApiKey: (provider: string, apiKey?: string) => Promise<{ valid: boolean; provider: string; message: string }>;
         getNvidiaModels: (apiKey?: string) => Promise<any[]>;
+        getLMStudioModels: (baseUrl?: string) => Promise<any[]>;
         nvidiaChatCompletion: (
           model: string,
           messages: { role: string; content: string }[],
           maxTokens?: number,
           temperature?: number,
+        ) => Promise<any>;
+        lmstudioChatCompletion: (
+          model: string,
+          messages: { role: string; content: string }[],
+          maxTokens?: number,
+          temperature?: number,
+          baseUrl?: string,
         ) => Promise<any>;
       };
       storage?: {

@@ -263,6 +263,7 @@ export const BrainView: React.FC = () => {
   const [showModelDropdown, setShowModelDropdown] = useState(false);
   const [modelSearchQuery, setModelSearchQuery] = useState('');
   const [availableModels, setAvailableModels] = useState<{ id: string, name?: string }[]>([]);
+  const [aiProvider, setAiProvider] = useState<'nvidia' | 'local' | 'lmstudio'>('nvidia');
   const [nvidiaApiKey, setNvidiaApiKey] = useState('');
   const [modelsLoading, setModelsLoading] = useState(true);
   const [isAiLoading, setIsAiLoading] = useState(false);
@@ -418,9 +419,29 @@ export const BrainView: React.FC = () => {
     const fetchModels = async () => {
       try {
         const settings = await window.nexusAPI?.settings?.get?.();
+        const provider = ((settings?.aiProvider || 'nvidia').toLowerCase() as 'nvidia' | 'local' | 'lmstudio');
+        const localProvider = provider === 'local' || provider === 'lmstudio';
+        setAiProvider(localProvider ? 'lmstudio' : 'nvidia');
         const key = settings?.nvidiaApiKey || '';
         setNvidiaApiKey(key);
         const lastModel = localStorage.getItem(BRAIN_LAST_MODEL_STORAGE_KEY) || settings?.defaultModel || DEFAULT_NIM_MODEL;
+
+        if (localProvider) {
+          const modelsRaw = await window.nexusAPI?.settings?.getLMStudioModels?.();
+          const normalized = (Array.isArray(modelsRaw) ? modelsRaw : [])
+            .map((m: any) => ({ id: m?.id || String(m), name: m?.name || m?.id || String(m) }))
+            .filter((m: { id: string }) => !!m.id);
+
+          if (normalized.length > 0) {
+            setAvailableModels(normalized);
+            const hasLastModel = normalized.some((m: { id: string }) => m.id === lastModel);
+            setSelectedModel(hasLastModel ? lastModel : normalized[0].id);
+          } else {
+            setAvailableModels([{ id: lastModel, name: lastModel }]);
+            setSelectedModel(lastModel);
+          }
+          return;
+        }
 
         if (!key) {
           setAvailableModels([{ id: DEFAULT_NIM_MODEL, name: DEFAULT_NIM_MODEL }]);
@@ -638,10 +659,10 @@ export const BrainView: React.FC = () => {
     const handleAiSend = async () => {
     if (!aiInput.trim() || isAiLoading) return;
 
-    if (!nvidiaApiKey) {
+    if (aiProvider === 'nvidia' && !nvidiaApiKey) {
       setAiMessages(prev => [...prev, {
         sender: 'ai',
-        text: 'NVIDIA API key is missing. Add it in Settings -> API Keys to use Brain AI.'
+        text: 'NVIDIA API key is missing. Add it in Settings -> API Keys, or switch provider to local LM Studio.'
       }]);
       return;
     }
@@ -703,6 +724,39 @@ export const BrainView: React.FC = () => {
           ...convoContext,
           { role: 'user', content: `${userMessage}\n\nCONTEXT:\n${noteContext}` }
         ];
+
+        if (aiProvider === 'local' || aiProvider === 'lmstudio') {
+          if (window.nexusAPI?.settings?.lmstudioChatCompletion) {
+            return await window.nexusAPI.settings.lmstudioChatCompletion(
+              modelId,
+              messages,
+              65536,
+              aiMode === 'edit' ? 0.15 : 0.45,
+            );
+          }
+
+          const response = await fetch('http://127.0.0.1:1234/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              model: modelId,
+              messages,
+              stream: false,
+              max_tokens: 65536,
+              temperature: aiMode === 'edit' ? 0.15 : 0.45,
+            }),
+            signal: abortControllerRef.current?.signal
+          });
+
+          if (!response.ok) {
+            const errorText = await response.text().catch(() => 'Unknown API error');
+            throw new Error(`Local API error (${response.status}) on ${modelId}: ${errorText.slice(0, 220)}`);
+          }
+
+          return response.json();
+        }
 
         if (window.nexusAPI?.settings?.nvidiaChatCompletion) {
           return await window.nexusAPI.settings.nvidiaChatCompletion(

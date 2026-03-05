@@ -265,8 +265,12 @@ pub async fn run_agentic_search_with_steps_and_history_and_scope(
 ) -> Result<AgentResult, String> {
     let api_key = crate::utils::config::resolve_api_key(&settings.ai.api_key);
     let model = &settings.ai.model;
-    
-    if api_key.is_empty() {
+    let use_local_llm = settings.ai.local_only
+        || settings.ai.provider.to_lowercase() == "local"
+        || settings.ai.provider.to_lowercase() == "lmstudio";
+    let lmstudio_url = settings.ai.lmstudio_url.as_deref();
+
+    if !use_local_llm && api_key.is_empty() {
         return Err("AI is disabled or API key is missing".to_string());
     }
 
@@ -408,7 +412,7 @@ pub async fn run_agentic_search_with_steps_and_history_and_scope(
             }
         };
 
-        call_llm_stream(model, &api_key, &messages, &mut full_response, on_token).await?;
+        call_llm_stream_with_provider(model, &api_key, use_local_llm, lmstudio_url, &messages, &mut full_response, on_token).await?;
 
         // 2. Parse Response
         let parsed_response = try_parse_tool_call_response(&full_response)
@@ -665,6 +669,8 @@ pub async fn run_agentic_search_with_steps_and_history_and_scope(
         app_handle,
         model,
         &api_key,
+        use_local_llm,
+        lmstudio_url,
         user_query,
         &resolved_scope,
         &steps,
@@ -2632,6 +2638,8 @@ async fn synthesize_answer_from_evidence(
     app_handle: &tauri::AppHandle,
     model: &str,
     api_key: &str,
+    use_local_llm: bool,
+    lmstudio_url: Option<&str>,
     user_query: &str,
     scope: &TimeScope,
     steps: &[AgentStep],
@@ -2671,7 +2679,7 @@ async fn synthesize_answer_from_evidence(
             content: summary_prompt,
         },
     ];
-    call_llm_stream(model, api_key, &messages, &mut out, on_token).await?;
+    call_llm_stream_with_provider(model, api_key, use_local_llm, lmstudio_url, &messages, &mut out, on_token).await?;
     if matches!(try_parse_tool_call_response(&out), Some(AgentResponse::ToolCall { .. })) {
         return Ok("I gathered evidence but could not produce a stable final summary. Please ask with a specific app/date and I’ll answer exactly.".to_string());
     }
@@ -2684,18 +2692,35 @@ async fn synthesize_answer_from_evidence(
 
 // Streaming LLM Call
 async fn call_llm_stream<F>(
-    model: &str, 
-    api_key: &str, 
-    messages: &[ChatMessage], 
+    model: &str,
+    api_key: &str,
+    messages: &[ChatMessage],
     output_buffer: &mut String,
-    mut on_token: F
-) -> Result<(), String> 
-where F: FnMut(&str) {
+    mut on_token: F,
+) -> Result<(), String>
+where
+    F: FnMut(&str),
+{
+    call_llm_stream_with_provider(model, api_key, false, None, messages, output_buffer, on_token).await
+}
+
+async fn call_llm_stream_with_provider<F>(
+    model: &str,
+    api_key: &str,
+    use_local_llm: bool,
+    lmstudio_url: Option<&str>,
+    messages: &[ChatMessage],
+    output_buffer: &mut String,
+    mut on_token: F,
+) -> Result<(), String>
+where
+    F: FnMut(&str),
+{
     let client = reqwest::Client::builder()
         .timeout(StdDuration::from_secs(LLM_TIMEOUT_SECS))
         .build()
         .map_err(|e| format!("Failed to init HTTP client: {}", e))?;
-    
+
     let request = ChatRequest {
         model: model.to_string(),
         messages: messages.to_vec(),
@@ -2704,11 +2729,23 @@ where F: FnMut(&str) {
         stream: true,
     };
 
-    let mut response = client
-        .post("https://integrate.api.nvidia.com/v1/chat/completions")
-        .header("Authorization", format!("Bearer {}", api_key))
+    let endpoint = if use_local_llm {
+        let base = lmstudio_url.unwrap_or("http://127.0.0.1:1234");
+        format!("{}/v1/chat/completions", base.trim_end_matches('/'))
+    } else {
+        "https://integrate.api.nvidia.com/v1/chat/completions".to_string()
+    };
+
+    let mut req = client
+        .post(&endpoint)
         .header("Content-Type", "application/json")
-        .json(&request)
+        .json(&request);
+
+    if !use_local_llm {
+        req = req.header("Authorization", format!("Bearer {}", api_key));
+    }
+
+    let mut response = req
         .send()
         .await
         .map_err(|e| format!("Net err: {}", e))?;

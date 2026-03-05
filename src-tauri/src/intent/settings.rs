@@ -300,6 +300,54 @@ pub async fn settings_get_nvidia_models(
 }
 
 #[tauri::command]
+pub async fn settings_get_lmstudio_models(
+    _app_handle: AppHandle,
+    base_url: Option<String>,
+) -> Result<Vec<ModelInfo>, String> {
+    let base = base_url
+        .unwrap_or_else(|| "http://127.0.0.1:1234".to_string())
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+
+    let base = if base.is_empty() {
+        "http://127.0.0.1:1234".to_string()
+    } else {
+        base
+    };
+
+    let url = format!("{}/v1/models", base);
+    let response = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to reach LM Studio at {}: {}", base, e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("LM Studio API {} — {}", status, &text[..text.len().min(400)]));
+    }
+
+    let value: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut models: Vec<ModelInfo> = (value.get("data")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+        .into_iter()
+        .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str).map(|id| id.to_string()))
+        .map(|id| ModelInfo { id })
+        .collect();
+
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(models)
+}
+
+#[tauri::command]
 pub async fn settings_nvidia_chat_completion(
     app_handle: AppHandle,
     model: String,
@@ -335,6 +383,49 @@ pub async fn settings_nvidia_chat_completion(
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
         return Err(format!("NVIDIA API {} — {}", status, &text[..text.len().min(400)]));
+    }
+
+    response.json::<Value>().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn settings_lmstudio_chat_completion(
+    _app_handle: AppHandle,
+    model: String,
+    messages: Vec<ChatTurn>,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    base_url: Option<String>,
+) -> Result<Value, String> {
+    let base = base_url
+        .unwrap_or_else(|| "http://127.0.0.1:1234".to_string())
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+
+    let base = if base.is_empty() {
+        "http://127.0.0.1:1234".to_string()
+    } else {
+        base
+    };
+
+    let payload = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens.unwrap_or(1024),
+        "temperature": temperature.unwrap_or(0.7),
+        "stream": false
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", base))
+        .json(&payload)
+        .send().await.map_err(|e| e.to_string())?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("LM Studio API {} — {}", status, &text[..text.len().min(400)]));
     }
 
     response.json::<Value>().await.map_err(|e| e.to_string())

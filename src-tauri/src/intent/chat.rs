@@ -492,6 +492,7 @@ pub async fn send_chat_message(
     session_id: String,
     message: String,
     model: Option<String>,
+    provider: Option<String>,
     time_range: Option<String>,
     selected_sources: Option<Vec<String>>,
     sources: Option<Vec<String>>,
@@ -531,13 +532,18 @@ pub async fn send_chat_message(
         general: crate::models::GeneralSettings::default(),
         tracking: crate::models::TrackingSettings::default(),
         storage: crate::models::StorageSettings::default(),
-        ai: AISettings {
-            enabled: true,
-            provider: "nvidia".to_string(),
-            api_key: nvidia_api_key.unwrap_or_default(),
-            model: model.unwrap_or_else(|| "meta/llama-3.3-70b-instruct".to_string()),
-            local_only: false,
-            fallback_to_local: true,
+        ai: {
+            let prov = provider.as_deref().unwrap_or("nvidia").to_lowercase();
+            let is_local = prov == "local" || prov == "lmstudio";
+            AISettings {
+                enabled: true,
+                provider: prov.clone(),
+                api_key: nvidia_api_key.unwrap_or_default(),
+                model: model.unwrap_or_else(|| "meta/llama-3.3-70b-instruct".to_string()),
+                local_only: is_local,
+                fallback_to_local: true,
+                lmstudio_url: None,
+            }
         },
         privacy: crate::models::PrivacySettings::default(),
         notifications: crate::models::NotificationSettings::default(),
