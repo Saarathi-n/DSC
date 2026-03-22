@@ -39,7 +39,9 @@ const App: React.FC = () => {
           const data = await window.nexusAPI.settings.get();
           if (data) setSettings(data);
         }
-      } catch { /* settings will use defaults */ }
+      } catch (err) {
+        console.warn('Failed to load settings on startup; using defaults.', err);
+      }
     };
     load();
   }, [isTrayPanelWindow, setSettings]);
@@ -51,7 +53,9 @@ const App: React.FC = () => {
     const register = async (promise: Promise<() => void>) => {
       const unlisten = await promise;
       if (disposed) {
-        try { unlisten(); } catch { }
+        try { unlisten(); } catch (err) {
+          console.warn('Failed to unlisten tray event during setup cleanup.', err);
+        }
         return;
       }
       unlisteners.push(unlisten);
@@ -121,8 +125,9 @@ const App: React.FC = () => {
         await register(listen<boolean>('tray:clear-notifications', () => {
           window.dispatchEvent(new CustomEvent('allentire:clear-notifications'));
         }));
-      } catch {
+      } catch (err) {
         // non-tauri runtime
+        console.debug('Tray listeners unavailable; likely non-Tauri runtime.', err);
       }
     };
     setup();
@@ -132,7 +137,9 @@ const App: React.FC = () => {
         for (const unlisten of unlisteners) {
           unlisten();
         }
-      } catch { }
+      } catch (err) {
+        console.warn('Failed to unlisten tray events on cleanup.', err);
+      }
     };
   }, [isTrayPanelWindow, setActiveTab, toggleMusic, nextTrack, prevTrack, setActivePlaylist]);
 
@@ -165,9 +172,13 @@ const App: React.FC = () => {
 
   useEffect(() => {
     if (isTrayPanelWindow) return;
-    publishStateToTray().catch(() => { /* ignore non-tauri runtime */ });
+    publishStateToTray().catch((err) => {
+      console.debug('Failed to publish initial tray state; likely non-Tauri runtime.', err);
+    });
     const interval = window.setInterval(() => {
-      publishStateToTray().catch(() => { /* ignore transient emit errors */ });
+      publishStateToTray().catch((err) => {
+        console.warn('Failed to publish tray state on interval tick.', err);
+      });
     }, 5000);
 
     return () => window.clearInterval(interval);

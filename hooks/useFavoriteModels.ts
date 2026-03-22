@@ -14,7 +14,9 @@ function loadFromStorage(): FavoriteModel[] {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) return JSON.parse(raw);
-  } catch { }
+  } catch (err) {
+    console.warn('Failed to load favorite models from localStorage.', err);
+  }
   return [];
 }
 
@@ -39,8 +41,8 @@ export function useFavoriteModels() {
           );
         }
       })
-      .catch(() => {
-        // Fallback to localStorage only.
+      .catch((err) => {
+        console.warn('Failed to refresh recent models; falling back to localStorage only.', err);
       });
   }, []);
 
@@ -66,7 +68,9 @@ export function useFavoriteModels() {
       setFavorites((prev) => prev.filter((m) => m.id !== modelId));
       removeRecentModel(modelId)
         .then(() => refreshRecent())
-        .catch(() => {});
+        .catch((err) => {
+          console.warn('Failed to remove recent model from backend.', err);
+        });
     },
     [refreshRecent]
   );
