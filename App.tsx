@@ -1,22 +1,24 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, Suspense } from 'react';
 import { emitTo, listen } from '@tauri-apps/api/event';
 import { AppLayout } from './components/layout/AppLayout';
 import { useNavStore } from './store/useNavStore';
 import { useIntentStore } from './store/useIntentStore';
 import { DashboardView } from './views/DashboardView';
-import { CodeView } from './views/CodeView';
-import { BrainView } from './views/BrainView';
-import { ScheduleView } from './views/ScheduleView';
-import { ZenView } from './views/ZenView';
-import { MusicView } from './views/MusicView';
-import { ChatView } from './views/ChatView';
-import { ActivityView } from './views/ActivityView';
-import { DiaryView } from './views/DiaryView';
-import { SettingsView } from './views/SettingsView';
 import { GlobalWidgets } from './components/GlobalWidgets';
 import { useMusicStore } from './store/useMusicStore';
 import { useTimerStore } from './store/useTimerStore';
 import { TrayPanelView } from './views/TrayPanelView';
+
+// Lazy-load heavy views to avoid blocking initial render
+const CodeView = React.lazy(() => import('./views/CodeView').then(m => ({ default: m.CodeView })));
+const BrainView = React.lazy(() => import('./views/BrainView').then(m => ({ default: m.BrainView })));
+const ScheduleView = React.lazy(() => import('./views/ScheduleView').then(m => ({ default: m.ScheduleView })));
+const ZenView = React.lazy(() => import('./views/ZenView').then(m => ({ default: m.ZenView })));
+const MusicView = React.lazy(() => import('./views/MusicView').then(m => ({ default: m.MusicView })));
+const ChatView = React.lazy(() => import('./views/ChatView').then(m => ({ default: m.ChatView })));
+const ActivityView = React.lazy(() => import('./views/ActivityView').then(m => ({ default: m.ActivityView })));
+const DiaryView = React.lazy(() => import('./views/DiaryView').then(m => ({ default: m.DiaryView })));
+const SettingsView = React.lazy(() => import('./views/SettingsView').then(m => ({ default: m.SettingsView })));
 
 const App: React.FC = () => {
   const isTrayPanelWindow = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('window') === 'tray';
@@ -166,7 +168,7 @@ const App: React.FC = () => {
     publishStateToTray().catch(() => { /* ignore non-tauri runtime */ });
     const interval = window.setInterval(() => {
       publishStateToTray().catch(() => { /* ignore transient emit errors */ });
-    }, 1000);
+    }, 5000);
 
     return () => window.clearInterval(interval);
   }, [isTrayPanelWindow]);
@@ -193,7 +195,13 @@ const App: React.FC = () => {
 
   return (
     <AppLayout>
-      {renderContent()}
+      <Suspense fallback={
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#666' }}>
+          Loading...
+        </div>
+      }>
+        {renderContent()}
+      </Suspense>
       <GlobalWidgets />
     </AppLayout>
   );

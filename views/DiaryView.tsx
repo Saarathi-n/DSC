@@ -32,7 +32,6 @@ export const DiaryView: React.FC = () => {
     const [yesterdaySummary, setYesterdaySummary] = useState<DiaryEntry | null>(null);
     const [editingId, setEditingId] = useState<string | null>(null);
     const [editContent, setEditContent] = useState('');
-    const [isGenerating, setIsGenerating] = useState(false);
     const [newContent, setNewContent] = useState('');
     const [isSavingManual, setIsSavingManual] = useState(false);
     const [isGeneratingYesterday, setIsGeneratingYesterday] = useState(false);
@@ -83,22 +82,6 @@ export const DiaryView: React.FC = () => {
         };
         loadYesterdaySummary();
     }, [yesterdayDate]);
-
-    const handleGenerate = async () => {
-        setIsGenerating(true);
-        try {
-            if (window.nexusAPI?.diary) {
-                const content = await window.nexusAPI.diary.generateEntry(activeDate);
-                const newEntry: DiaryEntry = {
-                    id: `ai-${Date.now()}`, date: activeDate, content,
-                    isAiGenerated: true, createdAt: Date.now() / 1000,
-                };
-                const saved = await window.nexusAPI.diary.saveEntry(newEntry);
-                setEntries(p => [saved, ...p]);
-            }
-        } catch { /* offline */ }
-        setIsGenerating(false);
-    };
 
     const handleGenerateYesterdaySummary = async () => {
         setIsGeneratingYesterday(true);
@@ -169,16 +152,7 @@ export const DiaryView: React.FC = () => {
                     <p className="text-xs text-gray-500">Personal dashboard + AI reflections + manual notes</p>
                 </div>
 
-                <div className="flex items-center gap-2">
-                    <button
-                        onClick={handleGenerate}
-                        disabled={isGenerating}
-                        className="flex items-center gap-2 px-3 py-2 rounded-lg bg-cyan-500/10 border border-cyan-500/20 text-cyan-400 hover:bg-cyan-500/15 transition-all text-xs font-medium disabled:opacity-50"
-                    >
-                        {isGenerating ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
-                        {isGenerating ? 'Generating…' : 'AI Generate'}
-                    </button>
-                </div>
+
             </div>
 
             {/* Date Navigation */}
@@ -260,7 +234,7 @@ export const DiaryView: React.FC = () => {
                     <div className="flex flex-col items-center justify-center h-56 text-gray-600">
                         <BookOpen size={36} className="mb-3 opacity-40" />
                         <p className="text-sm">No entries for this day yet.</p>
-                        <p className="text-xs mt-1">Click "AI Generate" to create one from your activity, or add a manual note above.</p>
+                        <p className="text-xs mt-1">Use "Generate Summary" above to create one from yesterday's activity, or add a manual note above.</p>
                     </div>
                 ) : currentDateEntries.map(entry => (
                     <div key={entry.id} className="bg-[#111] border border-[#1e1e1e] rounded-2xl p-5">

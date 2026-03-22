@@ -56,7 +56,7 @@ struct ActivityContext {
 
 fn time_range_start(now: i64, time_range: Option<&str>) -> i64 {
     match time_range.unwrap_or("today") {
-        "yesterday" => now - 2 * 86400,
+        "yesterday" => now - 86400,
         "last_3_days" => now - 3 * 86400,
         "last_7_days" => now - 7 * 86400,
         "last_30_days" => now - 30 * 86400,
@@ -164,7 +164,7 @@ fn collect_source_evidence(
         let mut snippets: Vec<String> = Vec::new();
         let mut found = 0;
         if let Ok(mut stmt) = conn.prepare(
-            "SELECT app_name, window_title, start_time, metadata FROM activities WHERE start_time >= ?1 ORDER BY start_time DESC LIMIT 80"
+            "SELECT app_name, window_title, start_time, metadata FROM activities WHERE start_time >= ?1 AND metadata IS NOT NULL ORDER BY start_time DESC LIMIT 80"
         ) {
             if let Ok(rows) = stmt.query_map([start], |row| {
                 Ok((
@@ -214,7 +214,7 @@ fn collect_source_evidence(
         let mut urls: Vec<String> = Vec::new();
         let mut found = 0;
         if let Ok(mut stmt) = conn.prepare(
-            "SELECT app_name, window_title, start_time, metadata FROM activities WHERE start_time >= ?1 ORDER BY start_time DESC LIMIT 120"
+            "SELECT app_name, window_title, start_time, metadata FROM activities WHERE start_time >= ?1 AND metadata IS NOT NULL ORDER BY start_time DESC LIMIT 120"
         ) {
             if let Ok(rows) = stmt.query_map([start], |row| {
                 Ok((
@@ -264,7 +264,7 @@ fn collect_source_evidence(
         let mut media_lines: Vec<String> = Vec::new();
         let mut found = 0;
         if let Ok(mut stmt) = conn.prepare(
-            "SELECT app_name, window_title, start_time, metadata FROM activities WHERE start_time >= ?1 ORDER BY start_time DESC LIMIT 100"
+            "SELECT app_name, window_title, start_time, metadata FROM activities WHERE start_time >= ?1 AND metadata IS NOT NULL ORDER BY start_time DESC LIMIT 100"
         ) {
             if let Ok(rows) = stmt.query_map([start], |row| {
                 Ok((
@@ -374,7 +374,8 @@ fn db_get_sessions(conn: &rusqlite::Connection) -> Result<Vec<ChatSession>, Stri
         "SELECT s.id, s.title, s.created_at, s.updated_at
          FROM chat_sessions s
          WHERE EXISTS (SELECT 1 FROM chat_messages m WHERE m.session_id = s.id)
-         ORDER BY s.updated_at DESC",
+         ORDER BY s.updated_at DESC
+         LIMIT 200",
     ).map_err(|e| e.to_string())?;
     let rows = stmt.query_map([], |row| Ok(ChatSession {
         id:         row.get(0)?,
@@ -382,7 +383,7 @@ fn db_get_sessions(conn: &rusqlite::Connection) -> Result<Vec<ChatSession>, Stri
         created_at: row.get(2)?,
         updated_at: row.get(3)?,
     })).map_err(|e| e.to_string())?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    Ok(rows.filter_map(|r| r.map_err(|e| eprintln!("[db] chat session row error: {e}")).ok()).collect())
 }
 
 fn db_get_messages(conn: &rusqlite::Connection, session_id: &str) -> Result<Vec<ChatMessageResponse>, String> {
@@ -400,7 +401,7 @@ fn db_get_messages(conn: &rusqlite::Connection, session_id: &str) -> Result<Vec<
         activities: row.get::<_, Option<String>>(6)?.and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(&s).ok()),
         metadata:   row.get(7)?,
     })).map_err(|e| e.to_string())?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    Ok(rows.filter_map(|r| r.map_err(|e| eprintln!("[db] chat message row error: {e}")).ok()).collect())
 }
 
 fn db_store_user_msg(conn: &rusqlite::Connection, session_id: &str, message: &str, now: i64) -> Result<(), String> {
@@ -433,13 +434,33 @@ fn db_store_user_msg(conn: &rusqlite::Connection, session_id: &str, message: &st
 }
 
 fn db_get_api_keys(conn: &rusqlite::Connection) -> Option<String> {
-    let nvidia_api_key = conn.query_row(
-        "SELECT value FROM app_settings WHERE key = 'nvidia_api_key'",
+    // Respect the user's configured ai_provider setting
+    let provider = conn.query_row(
+        "SELECT value FROM app_settings WHERE key = 'ai_provider'",
         [], |row| row.get::<_, String>(0),
-    ).ok().filter(|s| !s.is_empty())
-    .or_else(|| std::env::var("NVIDIA_API_KEY").ok().filter(|s| !s.is_empty()));
+    ).unwrap_or_else(|_| "nvidia".to_string());
 
-    nvidia_api_key
+    let setting_key = match provider.to_lowercase().as_str() {
+        "openai" => "openai_api_key",
+        "anthropic" => "anthropic_api_key",
+        "groq" => "groq_api_key",
+        _ => "nvidia_api_key",
+    };
+
+    conn.query_row(
+        "SELECT value FROM app_settings WHERE key = ?1",
+        [setting_key], |row| row.get::<_, String>(0),
+    ).ok().filter(|s| !s.is_empty())
+    .or_else(|| {
+        // Fallback to env var for the selected provider
+        let env_key = match provider.to_lowercase().as_str() {
+            "openai" => "OPENAI_API_KEY",
+            "anthropic" => "ANTHROPIC_API_KEY",
+            "groq" => "GROQ_API_KEY",
+            _ => "NVIDIA_API_KEY",
+        };
+        std::env::var(env_key).ok().filter(|s| !s.is_empty())
+    })
 }
 
 fn db_store_assistant_msg(
@@ -517,9 +538,15 @@ pub async fn send_chat_message(
     }).await.map_err(|e| e.to_string())?;
 
     // Convert prior messages to query engine format (exclude the one we just added)
+    // Truncate to last 20 messages to avoid unbounded context growth
     let prior_qe_messages: Vec<QEMessage> = prior_messages
         .iter()
         .filter(|m| m.created_at < now)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .take(20)
+        .rev()
         .map(|m| QEMessage {
             role: m.role.clone(),
             content: m.content.clone(),
@@ -637,7 +664,9 @@ async fn call_ai_api(
     #[derive(Deserialize)] struct Ch { message: Mc }
     #[derive(Deserialize)] struct Mc { content: String }
 
-    let resp = reqwest::Client::new()
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build().map_err(|e| e.to_string())?
         .post(endpoint)
         .header("Authorization", format!("Bearer {}", api_key))
         .json(&Req {

@@ -304,8 +304,12 @@ async fn refresh_access_token_if_needed(app: &tauri::AppHandle) -> Result<String
 }
 
 fn get_directory_tree(dir_path: &Path) -> Vec<FileNode> {
+    get_directory_tree_inner(dir_path, 0, 10)
+}
+
+fn get_directory_tree_inner(dir_path: &Path, depth: usize, max_depth: usize) -> Vec<FileNode> {
     let mut items = Vec::new();
-    if !dir_path.exists() || !dir_path.is_dir() {
+    if depth >= max_depth || !dir_path.exists() || !dir_path.is_dir() {
         return items;
     }
 
@@ -327,7 +331,7 @@ fn get_directory_tree(dir_path: &Path) -> Vec<FileNode> {
                 name: name.clone(),
                 path: path.to_string_lossy().to_string(),
                 is_directory: true,
-                children: Some(get_directory_tree(&path)),
+                children: Some(get_directory_tree_inner(&path, depth + 1, max_depth)),
             });
         } else if name.ends_with(".md") {
             items.push(FileNode {
@@ -516,31 +520,26 @@ fn read_runtime_settings(app_handle: &tauri::AppHandle) -> RuntimeSettings {
         Err(_) => return RuntimeSettings::default(),
     };
 
-    let read_bool = |key: &str, default: bool| -> bool {
-        conn.query_row(
-            "SELECT value FROM app_settings WHERE key = ?1",
-            [key],
-            |row| row.get::<_, String>(0),
-        )
-        .map(|v| v == "true")
-        .unwrap_or(default)
-    };
-
-    let read_string = |key: &str, default: &str| -> String {
-        conn.query_row(
-            "SELECT value FROM app_settings WHERE key = ?1",
-            [key],
-            |row| row.get::<_, String>(0),
-        )
-        .unwrap_or_else(|_| default.to_string())
-    };
+    // Batch all settings into a single query
+    let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT key, value FROM app_settings WHERE key IN ('track_apps','track_screen_ocr','enable_startup','startup_behavior','close_to_tray')"
+    ) {
+        if let Ok(rows) = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) {
+            for row in rows.filter_map(|r| r.ok()) {
+                map.insert(row.0, row.1);
+            }
+        }
+    }
 
     RuntimeSettings {
-        track_apps: read_bool("track_apps", true),
-        track_screen_ocr: read_bool("track_screen_ocr", false),
-        enable_startup: read_bool("enable_startup", true),
-        startup_behavior: read_string("startup_behavior", "minimized_to_tray"),
-        close_to_tray: read_bool("close_to_tray", true),
+        track_apps: map.get("track_apps").map(|v| v == "true").unwrap_or(true),
+        track_screen_ocr: map.get("track_screen_ocr").map(|v| v == "true").unwrap_or(false),
+        enable_startup: map.get("enable_startup").map(|v| v == "true").unwrap_or(true),
+        startup_behavior: map.get("startup_behavior").cloned().unwrap_or_else(|| "minimized_to_tray".to_string()),
+        close_to_tray: map.get("close_to_tray").map(|v| v == "true").unwrap_or(true),
     }
 }
 
@@ -866,19 +865,60 @@ fn mutation_err(message: impl Into<String>) -> MutationResult {
     }
 }
 
-#[tauri::command]
-fn notes_get_file_tree(vault_path: String) -> Vec<FileNode> {
-    get_directory_tree(Path::new(&vault_path))
+/// Validate that a path is within an expected vault directory to prevent path traversal.
+/// Returns the canonicalized path on success.
+fn validate_notes_path(file_path: &str, vault_path: Option<&str>) -> Result<PathBuf, String> {
+    let target = std::fs::canonicalize(file_path)
+        .or_else(|_| {
+            // If file doesn't exist yet, canonicalize the parent
+            let p = PathBuf::from(file_path);
+            if let Some(parent) = p.parent() {
+                std::fs::canonicalize(parent).map(|cp| cp.join(p.file_name().unwrap_or_default()))
+            } else {
+                Err(std::io::Error::new(std::io::ErrorKind::NotFound, "invalid path"))
+            }
+        })
+        .map_err(|e| format!("Invalid path: {e}"))?;
+
+    // If a vault path is provided, ensure the target is within it
+    if let Some(vault) = vault_path {
+        let vault_canon = std::fs::canonicalize(vault)
+            .map_err(|e| format!("Invalid vault path: {e}"))?;
+        if !target.starts_with(&vault_canon) {
+            return Err("Access denied: path is outside the vault directory".to_string());
+        }
+    }
+
+    // Additional safety: reject paths containing suspicious components
+    let path_str = target.to_string_lossy();
+    if path_str.contains("..") {
+        return Err("Access denied: path traversal detected".to_string());
+    }
+
+    Ok(target)
 }
 
 #[tauri::command]
-fn notes_read_file(file_path: String) -> Option<String> {
-    fs::read_to_string(file_path).ok()
+async fn notes_get_file_tree(vault_path: String) -> Result<Vec<FileNode>, String> {
+    tokio::task::spawn_blocking(move || {
+        Ok(get_directory_tree(Path::new(&vault_path)))
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn notes_write_file(file_path: String, content: String) -> bool {
-    fs::write(file_path, content).is_ok()
+async fn notes_read_file(file_path: String) -> Result<Option<String>, String> {
+    validate_notes_path(&file_path, None)?;
+    tokio::task::spawn_blocking(move || {
+        Ok(fs::read_to_string(file_path).ok())
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn notes_write_file(file_path: String, content: String) -> Result<bool, String> {
+    validate_notes_path(&file_path, None)?;
+    tokio::task::spawn_blocking(move || {
+        Ok(fs::write(file_path, content).is_ok())
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -923,6 +963,9 @@ fn notes_ensure_dir(dir_path: String) -> MutationResult {
 
 #[tauri::command]
 fn notes_delete(item_path: String) -> MutationResult {
+    if let Err(e) = validate_notes_path(&item_path, None) {
+        return mutation_err(e);
+    }
     let path = PathBuf::from(item_path);
     let result = if path.is_dir() {
         fs::remove_dir_all(path)
@@ -937,6 +980,13 @@ fn notes_delete(item_path: String) -> MutationResult {
 
 #[tauri::command]
 fn notes_rename(old_path: String, new_name: String) -> MutationResult {
+    if let Err(e) = validate_notes_path(&old_path, None) {
+        return mutation_err(e);
+    }
+    // Reject new names with path separators to prevent traversal
+    if new_name.contains('/') || new_name.contains('\\') || new_name.contains("..") {
+        return mutation_err("Invalid file name");
+    }
     let old = PathBuf::from(&old_path);
     let Some(parent) = old.parent() else {
         return mutation_err("Invalid source path");
@@ -950,6 +1000,12 @@ fn notes_rename(old_path: String, new_name: String) -> MutationResult {
 
 #[tauri::command]
 fn notes_move_file(source_path: String, destination_path: String) -> MutationResult {
+    if let Err(e) = validate_notes_path(&source_path, None) {
+        return mutation_err(e);
+    }
+    if let Err(e) = validate_notes_path(&destination_path, None) {
+        return mutation_err(e);
+    }
     let source = PathBuf::from(&source_path);
     let destination = PathBuf::from(&destination_path);
     if destination.starts_with(&source) {
@@ -1667,6 +1723,8 @@ pub fn run() {
             if let Err(e) = intent::db::init(app.handle()) {
                 eprintln!("[intent] DB init failed: {e}");
             }
+            // Run maintenance: data retention cleanup, storage limits, PRAGMA optimize
+            intent::storage::run_startup_maintenance(app.handle());
             
             let handle = app.handle().clone();
             intent::screen_capture::start_screen_capture(handle.clone());
@@ -1779,6 +1837,7 @@ pub fn run() {
             intent::settings::settings_validate_api_key,
             intent::settings::settings_nvidia_chat_completion,
             intent::settings::settings_lmstudio_chat_completion,
+            intent::settings::brain_chat_stream,
             intent::dashboard::dashboard_get_overview,
             intent::dashboard::dashboard_refresh_overview,
             intent::dashboard::dashboard_summarize_item,

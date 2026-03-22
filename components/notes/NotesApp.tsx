@@ -105,14 +105,32 @@ const renderMarkdown = (content: string, vaultPath: string) => {
 
         // Normal paragraph
         if (line.trim()) {
-            // Parse inline formatting
-            let formatted = line
-                .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-                .replace(/\*([^*]+)\*/g, '<em>$1</em>')
-                .replace(/`([^`]+)`/g, '<code style="background:#333;padding:2px 6px;border-radius:4px">$1</code>');
+            // Parse inline formatting safely (no dangerouslySetInnerHTML)
+            const parts: React.ReactNode[] = [];
+            const inlineRegex = /(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)/g;
+            let lastIndex = 0;
+            let match: RegExpExecArray | null;
+            let partKey = 0;
+            while ((match = inlineRegex.exec(line)) !== null) {
+                if (match.index > lastIndex) {
+                    parts.push(line.slice(lastIndex, match.index));
+                }
+                const token = match[0];
+                if (token.startsWith('**') && token.endsWith('**')) {
+                    parts.push(<strong key={`${i}-${partKey++}`}>{token.slice(2, -2)}</strong>);
+                } else if (token.startsWith('*') && token.endsWith('*')) {
+                    parts.push(<em key={`${i}-${partKey++}`}>{token.slice(1, -1)}</em>);
+                } else if (token.startsWith('`') && token.endsWith('`')) {
+                    parts.push(<code key={`${i}-${partKey++}`} style={{ background: '#333', padding: '2px 6px', borderRadius: '4px' }}>{token.slice(1, -1)}</code>);
+                }
+                lastIndex = match.index + token.length;
+            }
+            if (lastIndex < line.length) {
+                parts.push(line.slice(lastIndex));
+            }
 
             elements.push(
-                <p key={i} style={{ margin: '8px 0', lineHeight: '1.6' }} dangerouslySetInnerHTML={{ __html: formatted }} />
+                <p key={i} style={{ margin: '8px 0', lineHeight: '1.6' }}>{parts.length > 0 ? parts : line}</p>
             );
         } else {
             elements.push(<br key={i} />);
@@ -131,7 +149,7 @@ const FileTreeItem: React.FC<{
     onRefresh: () => void;
     expandedFolders: Set<string>;
     toggleFolder: (path: string) => void;
-}> = ({ node, depth, selectedPath, onSelect, onRefresh, expandedFolders, toggleFolder }) => {
+}> = React.memo(({ node, depth, selectedPath, onSelect, onRefresh, expandedFolders, toggleFolder }) => {
     const isExpanded = expandedFolders.has(node.path);
     const isSelected = selectedPath === node.path;
 
@@ -186,11 +204,11 @@ const FileTreeItem: React.FC<{
             )}
         </div>
     );
-};
+});
 
 export const NotesApp: React.FC = () => {
     // Default to the Notes folder in the project
-    const DEFAULT_VAULT = 'c:\\myself\\nonclgstuffs\\webdev\\all-in-one\\Notes';
+    const DEFAULT_VAULT = '';
 
     const [vaultPath, setVaultPath] = useState<string | null>(() => {
         return localStorage.getItem('notes_vaultPath') || DEFAULT_VAULT;
@@ -227,11 +245,20 @@ export const NotesApp: React.FC = () => {
         }
     }, [vaultPath]);
 
-    const loadFileTree = async () => {
+    // Module-level cache to survive remounts (view switches)
+    const loadFileTree = useCallback(async (force = false) => {
         if (!vaultPath || !window.nexusAPI?.notes) return;
+        // Use cached tree if available and recent (< 30s old)
+        const cacheKey = `__notesTreeCache_${vaultPath}`;
+        const cached = (window as any)[cacheKey];
+        if (!force && cached && Date.now() - cached.ts < 30000) {
+            setFileTree(cached.tree);
+            return;
+        }
         const tree = await window.nexusAPI.notes.getFileTree(vaultPath);
+        (window as any)[cacheKey] = { tree, ts: Date.now() };
         setFileTree(tree);
-    };
+    }, [vaultPath]);
 
     const selectVault = async () => {
         if (!window.nexusAPI?.notes) {
@@ -357,7 +384,7 @@ export const NotesApp: React.FC = () => {
                     }}>
                         {vaultPath.split(/[/\\]/).pop()}
                     </span>
-                    <button onClick={loadFileTree} style={iconBtnStyle}><RefreshCw size={14} /></button>
+                    <button onClick={() => loadFileTree(true)} style={iconBtnStyle}><RefreshCw size={14} /></button>
                     <button onClick={() => setShowNewFileInput(true)} style={iconBtnStyle}><FilePlus size={14} /></button>
                 </div>
 

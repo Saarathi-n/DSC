@@ -176,6 +176,14 @@ export function initNexusApi() {
         temperature?: number,
         baseUrl?: string,
       ) => invoke<any>('settings_lmstudio_chat_completion', { model, messages, maxTokens, temperature, baseUrl }),
+      brainChatStream: (
+        model: string,
+        messages: { role: string; content: string }[],
+        useLocal: boolean,
+        maxTokens?: number,
+        temperature?: number,
+        baseUrl?: string,
+      ) => invoke<void>('brain_chat_stream', { model, messages, useLocal, maxTokens, temperature, baseUrl }),
     },
     storage: {
       getStats: () => invoke<any>('storage_get_stats'),
@@ -283,6 +291,14 @@ declare global {
           temperature?: number,
           baseUrl?: string,
         ) => Promise<any>;
+        brainChatStream: (
+          model: string,
+          messages: { role: string; content: string }[],
+          useLocal: boolean,
+          maxTokens?: number,
+          temperature?: number,
+          baseUrl?: string,
+        ) => Promise<void>;
       };
       storage?: {
         getStats: () => Promise<any>;

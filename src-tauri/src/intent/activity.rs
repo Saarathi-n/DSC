@@ -146,7 +146,13 @@ pub async fn get_activities(
         },
     ).map_err(|e| e.to_string())?;
 
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    Ok(rows.filter_map(|r| match r {
+        Ok(activity) => Some(activity),
+        Err(e) => {
+            eprintln!("[get_activities] Failed to parse activity row: {}", e);
+            None
+        }
+    }).collect())
 }
 
 #[tauri::command]

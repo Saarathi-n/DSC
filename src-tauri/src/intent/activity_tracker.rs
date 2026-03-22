@@ -340,12 +340,8 @@ fn categorize_window(app_name: &str, title: &str) -> i32 {
 }
 
 fn store_activity(app_handle: &AppHandle, activity: &ActivityEvent) -> Result<(), String> {
-    // Get database path
-    let data_dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
-    let db_path = data_dir.join("allentire_intent.db");
-    
-    // Open connection and store
-    let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
+    // Use db::open() to get a connection with all performance PRAGMAs applied
+    let conn = crate::intent::db::open(app_handle)?;
     
     let metadata_blob = serde_json::to_vec(&activity.metadata).map_err(|e| e.to_string())?;
     

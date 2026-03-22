@@ -13,9 +13,16 @@ pub fn db_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 pub fn open(app: &tauri::AppHandle) -> Result<Connection, String> {
     let path = db_path(app)?;
     let conn = Connection::open(&path).map_err(|e| e.to_string())?;
-    // Enable WAL mode for concurrent access
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-        .map_err(|e| e.to_string())?;
+    // Performance-critical PRAGMAs — applied on every connection open
+    conn.execute_batch("
+        PRAGMA journal_mode=WAL;
+        PRAGMA foreign_keys=ON;
+        PRAGMA synchronous=NORMAL;
+        PRAGMA cache_size=-8000;
+        PRAGMA temp_store=MEMORY;
+        PRAGMA mmap_size=268435456;
+    ")
+    .map_err(|e| e.to_string())?;
     Ok(conn)
 }
 
@@ -51,6 +58,9 @@ pub fn init(app: &tauri::AppHandle) -> Result<(), String> {
             FOREIGN KEY (category_id) REFERENCES categories(id)
         );
         CREATE INDEX IF NOT EXISTS idx_act_start ON activities(start_time);
+        CREATE INDEX IF NOT EXISTS idx_act_end ON activities(end_time);
+        CREATE INDEX IF NOT EXISTS idx_act_category ON activities(category_id);
+        CREATE INDEX IF NOT EXISTS idx_act_app_name ON activities(app_name);
         
         CREATE TABLE IF NOT EXISTS code_file_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,6 +72,7 @@ pub fn init(app: &tauri::AppHandle) -> Result<(), String> {
             detected_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_code_file_events_detected_at ON code_file_events(detected_at);
+        CREATE INDEX IF NOT EXISTS idx_code_file_events_project ON code_file_events(project_root);
 
         CREATE TABLE IF NOT EXISTS chat_sessions (
             id         TEXT    PRIMARY KEY,
@@ -92,6 +103,7 @@ pub fn init(app: &tauri::AppHandle) -> Result<(), String> {
             updated_at     INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_diary_date ON diary_entries(date);
+        CREATE INDEX IF NOT EXISTS idx_diary_created ON diary_entries(created_at);
 
         CREATE TABLE IF NOT EXISTS app_settings (
             key        TEXT PRIMARY KEY,

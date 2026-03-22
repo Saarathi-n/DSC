@@ -300,7 +300,7 @@ pub async fn run_agentic_search_with_steps_and_history_and_scope(
         };
         messages.push(ChatMessage {
             role: role.to_string(),
-            content: truncate_for_token_limit(&msg.content, 1200),
+            content: truncate_for_token_limit(&msg.content, 4000),
         });
     }
 
@@ -346,7 +346,7 @@ pub async fn run_agentic_search_with_steps_and_history_and_scope(
                 role: "user".to_string(),
                 content: format!(
                     "Pre-aggregated long-range evidence:\n{}\nUse this structured evidence first. Only call extra tools if there are clear gaps.",
-                    truncate_for_token_limit(&digest, 3500)
+                    truncate_for_token_limit(&digest, 15000)
                 ),
             });
         }
@@ -362,14 +362,14 @@ pub async fn run_agentic_search_with_steps_and_history_and_scope(
                 turn: 0,
                 tool_name: "parallel_search".to_string(),
                 tool_args: prefetch_args,
-                tool_result: truncate_for_token_limit(&prefetch_output, 4000),
+                tool_result: truncate_for_token_limit(&prefetch_output, 15000),
                 reasoning: "Prefetch evidence for broad multi-source summary".to_string(),
             });
             messages.push(ChatMessage {
                 role: "user".to_string(),
                 content: format!(
                     "Prefetched evidence before tool-planning:\n{}",
-                    truncate_for_token_limit(&prefetch_output, 3500)
+                    truncate_for_token_limit(&prefetch_output, 15000)
                 ),
             });
         }
@@ -439,7 +439,7 @@ pub async fn run_agentic_search_with_steps_and_history_and_scope(
                         all_activities.extend(activities);
                         dedupe_activities(&mut all_activities);
                     }
-                    let truncated = truncate_for_token_limit(&out, 8000);
+                    let truncated = truncate_for_token_limit(&out, 20000);
                     steps.push(AgentStep {
                         turn: turn + 1,
                         tool_name: "parallel_search".to_string(),
@@ -455,7 +455,7 @@ pub async fn run_agentic_search_with_steps_and_history_and_scope(
                         role: "user".to_string(),
                         content: format!(
                             "You attempted to answer without evidence. Use this forced evidence and continue with additional tool calls if needed:\n{}",
-                            truncate_for_token_limit(&truncated, 3500)
+                            truncate_for_token_limit(&truncated, 15000)
                         ),
                     });
                     continue;
@@ -500,7 +500,7 @@ pub async fn run_agentic_search_with_steps_and_history_and_scope(
                             all_activities.extend(activities);
                             dedupe_activities(&mut all_activities);
                         }
-                        let truncated = truncate_for_token_limit(&out, 8000);
+                        let truncated = truncate_for_token_limit(&out, 20000);
                         steps.push(AgentStep {
                             turn: turn + 1,
                             tool_name: "parallel_search".to_string(),
@@ -516,7 +516,7 @@ pub async fn run_agentic_search_with_steps_and_history_and_scope(
                             role: "user".to_string(),
                             content: format!(
                                 "Your answer was not sufficiently evidenced. Continue using this tool output and fetch more if needed:\n{}",
-                                truncate_for_token_limit(&truncated, 3500)
+                                truncate_for_token_limit(&truncated, 15000)
                             ),
                         });
                         continue;
@@ -644,7 +644,7 @@ pub async fn run_agentic_search_with_steps_and_history_and_scope(
                 } else {
                     tool_output
                 };
-                let truncated_output = truncate_for_token_limit(&with_retry_note, 10000);
+                let truncated_output = truncate_for_token_limit(&with_retry_note, 25000);
                 
                 // Record step
                 steps.push(AgentStep {
@@ -1153,7 +1153,7 @@ fn execute_and_record_long_range_step(
     } else {
         tool_output
     };
-    let truncated = truncate_for_token_limit(&with_retry_note, 10000);
+    let truncated = truncate_for_token_limit(&with_retry_note, 25000);
     steps.push(AgentStep {
         turn: 0,
         tool_name: tool.to_string(),
@@ -1166,7 +1166,7 @@ fn execute_and_record_long_range_step(
     digest_parts.push(format!(
         "{} -> {}",
         tool,
-        truncate_for_token_limit(&normalize_whitespace(&truncated), 900)
+        truncate_for_token_limit(&normalize_whitespace(&truncated), 4000)
     ));
     Ok(())
 }
@@ -1333,7 +1333,7 @@ fn execute_parallel_search(
         ));
         combined_output.push_str(&format!(
             "  {}\n",
-            truncate_for_token_limit(&normalize_whitespace(&output), 500)
+            truncate_for_token_limit(&normalize_whitespace(&output), 5000)
         ));
         combined_activities.extend(transform_activities_for_frontend(&tool, &activities));
     }
@@ -1853,7 +1853,7 @@ fn execute_tool(conn: &Connection, tool: &str, args: &Value) -> Result<(String, 
                                 }
                                 if cleaned.to_lowercase().contains(&keyword.to_lowercase()) {
                                     let snippet = truncate_snippet(&cleaned, &keyword.to_lowercase());
-                                    let short = normalize_whitespace(&snippet.chars().take(500).collect::<String>());
+                                    let short = normalize_whitespace(&snippet.chars().take(3000).collect::<String>());
                                     if !seen_snippets.insert(short.clone()) {
                                         continue;
                                     }
@@ -1955,7 +1955,7 @@ fn execute_tool(conn: &Connection, tool: &str, args: &Value) -> Result<(String, 
                                     }
                                 }
 
-                                let short = normalize_whitespace(&normalized_text.chars().take(500).collect::<String>());
+                                let short = normalize_whitespace(&normalized_text.chars().take(3000).collect::<String>());
                                 if !seen_snippets.insert(short.clone()) {
                                     continue;
                                 }
@@ -2651,7 +2651,7 @@ async fn synthesize_answer_from_evidence(
             "{}. {} -> {}",
             i + 1,
             step.tool_name,
-            truncate_for_token_limit(&step.tool_result, 8000)
+            truncate_for_token_limit(&step.tool_result, 20000)
         ));
     }
 
@@ -2725,7 +2725,7 @@ where
         model: model.to_string(),
         messages: messages.to_vec(),
         temperature: 0.0,
-        max_tokens: 1600,
+        max_tokens: 8192,
         stream: true,
     };
 

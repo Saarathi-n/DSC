@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -27,7 +29,7 @@ pub fn start_file_monitor(app_handle: AppHandle) {
 
         let mut known_mtimes: HashMap<String, i64> = HashMap::new();
         let mut known_dirs: HashSet<String> = HashSet::new();
-        let mut known_content: HashMap<String, String> = HashMap::new();
+        let mut known_hashes: HashMap<String, u64> = HashMap::new();
         let mut initialized_roots: HashSet<String> = HashSet::new();
 
         loop {
@@ -36,13 +38,23 @@ pub fn start_file_monitor(app_handle: AppHandle) {
                 continue;
             }
 
+            // Open ONE connection per scan cycle instead of per event
+            let conn = match crate::intent::db::open(&app_handle) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[FileMonitor] Failed to open DB: {e}");
+                    tokio::time::sleep(Duration::from_secs(SCAN_INTERVAL_SECS)).await;
+                    continue;
+                }
+            };
+
             for root in &roots {
                 scan_root(
-                    &app_handle,
+                    &conn,
                     root,
                     &mut known_mtimes,
                     &mut known_dirs,
-                    &mut known_content,
+                    &mut known_hashes,
                     &mut initialized_roots,
                 );
             }
@@ -88,12 +100,18 @@ fn discover_roots() -> Vec<PathBuf> {
     unique
 }
 
+fn hash_content(content: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn scan_root(
-    app_handle: &AppHandle,
+    conn: &rusqlite::Connection,
     root: &Path,
     known_mtimes: &mut HashMap<String, i64>,
     known_dirs: &mut HashSet<String>,
-    known_content: &mut HashMap<String, String>,
+    known_hashes: &mut HashMap<String, u64>,
     initialized_roots: &mut HashSet<String>,
 ) {
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -114,7 +132,7 @@ fn scan_root(
             seen_dirs_in_scan.insert(dir_str.clone());
             if initialized && !known_dirs.contains(&dir_str) {
                 let _ = insert_event(
-                    app_handle,
+                    conn,
                     &dir_str,
                     &root_string,
                     "folder",
@@ -137,13 +155,13 @@ fn scan_root(
             None => {
                 known_mtimes.insert(path_str.clone(), mtime);
                 if let Some(content) = read_file_snapshot(path) {
-                    known_content.insert(path_str.clone(), content);
+                    known_hashes.insert(path_str.clone(), hash_content(&content));
                 }
                 if now_ms - mtime <= RECENT_CREATE_WINDOW_MS {
                     let created_preview = read_file_snapshot(path)
                         .map(|content| format!("Initial content:\n{}", truncate_chars(&content, MAX_PREVIEW_CHARS)));
                     let _ = insert_event(
-                        app_handle,
+                        conn,
                         &path_str,
                         &root_string,
                         "file",
@@ -155,21 +173,29 @@ fn scan_root(
             }
             Some(prev) if mtime > prev => {
                 known_mtimes.insert(path_str.clone(), mtime);
-                let previous = known_content.get(&path_str).cloned();
                 let current = read_file_snapshot(path);
-                let preview = build_change_preview(previous.as_deref(), current.as_deref());
-                if let Some(content) = current {
-                    known_content.insert(path_str.clone(), content);
+                // Only record a change if the content actually differs
+                let current_hash = current.as_deref().map(hash_content);
+                let prev_hash = known_hashes.get(&path_str).copied();
+                let content_changed = match (current_hash, prev_hash) {
+                    (Some(c), Some(p)) => c != p,
+                    _ => true,
+                };
+                if content_changed {
+                    if let Some(h) = current_hash {
+                        known_hashes.insert(path_str.clone(), h);
+                    }
+                    let preview = current.as_deref().map(|c| truncate_chars(c, MAX_PREVIEW_CHARS));
+                    let _ = insert_event(
+                        conn,
+                        &path_str,
+                        &root_string,
+                        "file",
+                        "modified",
+                        preview.as_deref(),
+                        now,
+                    );
                 }
-                let _ = insert_event(
-                    app_handle,
-                    &path_str,
-                    &root_string,
-                    "file",
-                    "modified",
-                    preview.as_deref(),
-                    now,
-                );
             }
             _ => {}
         }
@@ -184,7 +210,7 @@ fn scan_root(
         known_dirs.remove(&path);
         if initialized {
             let _ = insert_event(
-                app_handle,
+                conn,
                 &path,
                 &root_string,
                 "folder",
@@ -204,9 +230,9 @@ fn scan_root(
         .collect();
     for path in deleted {
         known_mtimes.remove(&path);
-        known_content.remove(&path);
+        known_hashes.remove(&path);
         let _ = insert_event(
-            app_handle,
+            conn,
             &path,
             &root_string,
             "file",
@@ -220,7 +246,7 @@ fn scan_root(
 }
 
 fn insert_event(
-    app_handle: &AppHandle,
+    conn: &rusqlite::Connection,
     path: &str,
     project_root: &str,
     entity_type: &str,
@@ -228,10 +254,6 @@ fn insert_event(
     content_preview: Option<&str>,
     detected_at: i64,
 ) -> Result<(), String> {
-    let data_dir = app_handle.path().app_data_dir().map_err(|e| e.to_string())?;
-    // Intentflow DB Name Fix
-    let db_path = data_dir.join("allentire_intent.db");
-    let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
     conn.execute(
         "INSERT INTO code_file_events (path, project_root, entity_type, change_type, content_preview, detected_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",

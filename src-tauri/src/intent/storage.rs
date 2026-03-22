@@ -180,6 +180,52 @@ pub fn enforce_max_storage_mb(app_handle: &AppHandle, max_storage_mb: i64) -> Re
     Ok(current_size < db_size_bytes(app_handle)?)
 }
 
+/// Run startup maintenance: data retention cleanup, storage limits, and PRAGMA optimize.
+/// Call this once during app setup after db::init().
+pub fn run_startup_maintenance(app_handle: &AppHandle) {
+    let conn = match crate::intent::db::open(app_handle) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    // 1. Read settings for retention and cleanup config
+    let retention_days: i64 = conn.query_row(
+        "SELECT value FROM app_settings WHERE key = 'data_retention_days'",
+        [], |row| row.get::<_, String>(0),
+    ).ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+
+    let auto_cleanup: bool = conn.query_row(
+        "SELECT value FROM app_settings WHERE key = 'auto_cleanup'",
+        [], |row| row.get::<_, String>(0),
+    ).map(|v| v == "true").unwrap_or(true);
+
+    let max_storage_mb: i64 = conn.query_row(
+        "SELECT value FROM app_settings WHERE key = 'max_storage_mb'",
+        [], |row| row.get::<_, String>(0),
+    ).ok().and_then(|v| v.parse().ok()).unwrap_or(512);
+
+    // 2. Data retention: delete records older than retention_days
+    if retention_days > 0 {
+        let cutoff = chrono::Utc::now().timestamp() - (retention_days * 86400);
+        let _ = conn.execute(
+            "DELETE FROM activities WHERE start_time < ?1",
+            rusqlite::params![cutoff],
+        );
+        let _ = conn.execute(
+            "DELETE FROM code_file_events WHERE detected_at < ?1",
+            rusqlite::params![cutoff],
+        );
+    }
+
+    // 3. Enforce max storage if auto_cleanup is on
+    if auto_cleanup {
+        let _ = enforce_max_storage_mb(app_handle, max_storage_mb);
+    }
+
+    // 4. PRAGMA optimize — lets SQLite auto-tune indexes based on query patterns
+    let _ = conn.execute_batch("PRAGMA optimize;");
+}
+
 fn dump_table(conn: &rusqlite::Connection, table: &str) -> Result<Vec<Value>, String> {
     let sql = format!("SELECT * FROM {}", table);
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;

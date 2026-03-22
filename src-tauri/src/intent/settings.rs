@@ -67,64 +67,57 @@ pub struct KeyValidationResult {
 fn load_settings_inner(conn: &rusqlite::Connection) -> AppSettings {
     let mut s = AppSettings::default();
 
-    let pairs = [
-        ("nvidia_api_key",        &mut s.nvidia_api_key         as *mut String),
-        ("openai_api_key",        &mut s.openai_api_key         as *mut String),
-        ("anthropic_api_key",     &mut s.anthropic_api_key      as *mut String),
-        ("groq_api_key",          &mut s.groq_api_key           as *mut String),
-        ("google_client_id",      &mut s.google_client_id       as *mut String),
-        ("google_client_secret",  &mut s.google_client_secret   as *mut String),
-        ("default_model",         &mut s.default_model          as *mut String),
-        ("ai_provider",           &mut s.ai_provider            as *mut String),
-        ("color_scheme",          &mut s.color_scheme           as *mut String),
-        ("locale",                &mut s.locale                 as *mut String),
-        ("date_format",           &mut s.date_format            as *mut String),
-    ];
-
-    for (key, ptr) in &pairs {
-        if let Ok(val) = conn.query_row(
-            "SELECT value FROM app_settings WHERE key = ?1",
-            [*key],
-            |row| row.get::<_, String>(0),
-        ) {
-            unsafe { **ptr = val; }
+    // Batch all settings into a single query instead of 25 individual queries
+    let mut settings_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT key, value FROM app_settings") {
+        if let Ok(rows) = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) {
+            for row in rows.filter_map(|r| r.ok()) {
+                settings_map.insert(row.0, row.1);
+            }
         }
     }
 
-    // Bool + int settings
-    let read_bool = |key: &str, default: bool| -> bool {
-        conn.query_row(
-            "SELECT value FROM app_settings WHERE key = ?1",
-            [key], |row| row.get::<_, String>(0),
-        ).map(|v| v == "true").unwrap_or(default)
+    let get_str = |key: &str, default: &str| -> String {
+        settings_map.get(key).cloned().unwrap_or_else(|| default.to_string())
     };
-    let read_i64 = |key: &str, default: i64| -> i64 {
-        conn.query_row(
-            "SELECT value FROM app_settings WHERE key = ?1",
-            [key], |row| row.get::<_, String>(0),
-        ).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    let get_bool = |key: &str, default: bool| -> bool {
+        settings_map.get(key).map(|v| v == "true").unwrap_or(default)
+    };
+    let get_i64 = |key: &str, default: i64| -> i64 {
+        settings_map.get(key).and_then(|v| v.parse().ok()).unwrap_or(default)
     };
 
-    s.track_apps         = read_bool("track_apps",          true);
-    s.track_screen_ocr   = read_bool("track_screen_ocr",    false);
-    s.track_media        = read_bool("track_media",         true);
-    s.track_browser      = read_bool("track_browser",       false);
-    s.data_retention_days = read_i64("data_retention_days", 30);
-    s.enable_startup     = read_bool("enable_startup",      true);
-    s.minimize_to_tray   = read_bool("minimize_to_tray",    true);
-    s.close_to_tray      = read_bool("close_to_tray",       true);
-    s.max_storage_mb     = read_i64("max_storage_mb",       512);
-    s.auto_cleanup       = read_bool("auto_cleanup",        true);
-    s.enable_notifications = read_bool("enable_notifications", true);
-    s.enable_reminders     = read_bool("enable_reminders", false);
-    s.enable_summary_alerts = read_bool("enable_summary_alerts", true);
-    s.compact_mode         = read_bool("compact_mode", false);
-    s.font_scale           = read_i64("font_scale_percent", 100) as f32 / 100.0;
-    s.startup_behavior = conn.query_row(
-        "SELECT value FROM app_settings WHERE key = 'startup_behavior'",
-        [],
-        |row| row.get::<_, String>(0),
-    ).unwrap_or_else(|_| "minimized_to_tray".to_string());
+    s.nvidia_api_key = get_str("nvidia_api_key", "");
+    s.openai_api_key = get_str("openai_api_key", "");
+    s.anthropic_api_key = get_str("anthropic_api_key", "");
+    s.groq_api_key = get_str("groq_api_key", "");
+    s.google_client_id = get_str("google_client_id", "");
+    s.google_client_secret = get_str("google_client_secret", "");
+    s.default_model = get_str("default_model", "");
+    s.ai_provider = get_str("ai_provider", "nvidia");
+    s.color_scheme = get_str("color_scheme", "dark");
+    s.locale = get_str("locale", "en-US");
+    s.date_format = get_str("date_format", "YYYY-MM-DD");
+    s.startup_behavior = get_str("startup_behavior", "minimized_to_tray");
+
+    s.track_apps = get_bool("track_apps", true);
+    s.track_screen_ocr = get_bool("track_screen_ocr", false);
+    s.track_media = get_bool("track_media", true);
+    s.track_browser = get_bool("track_browser", false);
+    s.data_retention_days = get_i64("data_retention_days", 30);
+    s.enable_startup = get_bool("enable_startup", true);
+    s.minimize_to_tray = get_bool("minimize_to_tray", true);
+    s.close_to_tray = get_bool("close_to_tray", true);
+    s.max_storage_mb = get_i64("max_storage_mb", 512);
+    s.auto_cleanup = get_bool("auto_cleanup", true);
+    s.enable_notifications = get_bool("enable_notifications", true);
+    s.enable_reminders = get_bool("enable_reminders", false);
+    s.enable_summary_alerts = get_bool("enable_summary_alerts", true);
+    s.compact_mode = get_bool("compact_mode", false);
+    s.font_scale = get_i64("font_scale_percent", 100) as f32 / 100.0;
+
     s
 }
 
@@ -239,7 +232,10 @@ pub async fn settings_validate_api_key(
         _ => ("https://integrate.api.nvidia.com/v1/models", format!("Bearer {}", key)),
     };
 
-    let mut request = reqwest::Client::new().get(url);
+    let mut request = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build().map_err(|e| e.to_string())?
+        .get(url);
     request = if provider_norm == "anthropic" {
         request
             .header("x-api-key", auth_header)
@@ -280,7 +276,9 @@ pub async fn settings_get_nvidia_models(
         .ok_or_else(|| "Missing NVIDIA API key".to_string())?
     };
 
-    let value: serde_json::Value = reqwest::Client::new()
+    let value: serde_json::Value = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build().map_err(|e| e.to_string())?
         .get("https://integrate.api.nvidia.com/v1/models")
         .header("Authorization", format!("Bearer {}", key))
         .send().await.map_err(|e| e.to_string())?
@@ -317,7 +315,9 @@ pub async fn settings_get_lmstudio_models(
     };
 
     let url = format!("{}/v1/models", base);
-    let response = reqwest::Client::new()
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build().map_err(|e| format!("Failed to build HTTP client: {e}"))?
         .get(&url)
         .send()
         .await
@@ -373,7 +373,9 @@ pub async fn settings_nvidia_chat_completion(
         "stream": false
     });
 
-    let response = reqwest::Client::new()
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build().map_err(|e| e.to_string())?
         .post("https://integrate.api.nvidia.com/v1/chat/completions")
         .header("Authorization", format!("Bearer {}", key))
         .json(&payload)
@@ -417,7 +419,9 @@ pub async fn settings_lmstudio_chat_completion(
         "stream": false
     });
 
-    let response = reqwest::Client::new()
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build().map_err(|e| e.to_string())?
         .post(format!("{}/v1/chat/completions", base))
         .json(&payload)
         .send().await.map_err(|e| e.to_string())?;
@@ -430,3 +434,112 @@ pub async fn settings_lmstudio_chat_completion(
 
     response.json::<Value>().await.map_err(|e| e.to_string())
 }
+
+/// Stream a chat completion for the Brain (notes) view.
+/// Emits `brain://token` events for each token and `brain://done` when complete.
+/// This mirrors how the chat agent streams via `chat://token`, bypassing CORS.
+#[tauri::command]
+pub async fn brain_chat_stream(
+    app_handle: AppHandle,
+    model: String,
+    messages: Vec<ChatTurn>,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    use_local: bool,
+    base_url: Option<String>,
+) -> Result<(), String> {
+    use tauri::Emitter;
+
+    let nvidia_key = if !use_local {
+        let conn = crate::intent::db::open(&app_handle)?;
+        conn.query_row(
+            "SELECT value FROM app_settings WHERE key = 'nvidia_api_key'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("NVIDIA_API_KEY").ok().filter(|s| !s.is_empty()))
+        .ok_or_else(|| "Missing NVIDIA API key".to_string())?
+    } else {
+        String::new()
+    };
+
+    let lm_url = base_url
+        .unwrap_or_else(|| "http://127.0.0.1:1234".to_string());
+    let lm_url_trimmed = lm_url.trim().trim_end_matches('/').to_string();
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| format!("Failed to init HTTP client: {}", e))?;
+
+    let endpoint = if use_local {
+        format!("{}/v1/chat/completions", lm_url_trimmed)
+    } else {
+        "https://integrate.api.nvidia.com/v1/chat/completions".to_string()
+    };
+
+    let payload = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens.unwrap_or(65536),
+        "temperature": temperature.unwrap_or(0.5),
+        "stream": true
+    });
+
+    let mut req = client
+        .post(&endpoint)
+        .header("Content-Type", "application/json")
+        .json(&payload);
+
+    if !use_local {
+        req = req.header("Authorization", format!("Bearer {}", nvidia_key));
+    }
+
+    let mut response = req.send().await.map_err(|e| format!("Net error: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("API error {}: {}", status, &text[..text.len().min(400)]));
+    }
+
+    // Stream SSE lines and emit each token as a Tauri event
+    let mut buffer = String::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        let chunk_str = String::from_utf8_lossy(&chunk);
+        buffer.push_str(&chunk_str);
+
+        let lines: Vec<&str> = buffer.split('\n').collect();
+        let keep_last = if chunk_str.ends_with('\n') {
+            String::new()
+        } else {
+            lines.last().unwrap_or(&"").to_string()
+        };
+
+        for line in &lines[..lines.len().saturating_sub(1)] {
+            let line = line.trim();
+            if !line.starts_with("data: ") { continue; }
+            let data = &line[6..];
+            if data == "[DONE]" { break; }
+
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                let delta = &json["choices"][0]["delta"];
+                // reasoning_content (DeepSeek / Qwen models)
+                if let Some(r) = delta["reasoning_content"].as_str().filter(|s| !s.is_empty()) {
+                    let _ = app_handle.emit("brain://token", r);
+                }
+                if let Some(c) = delta["content"].as_str().filter(|s| !s.is_empty()) {
+                    let _ = app_handle.emit("brain://token", c);
+                }
+            }
+        }
+
+        buffer = keep_last;
+    }
+
+    let _ = app_handle.emit("brain://done", "");
+    Ok(())
+}
+

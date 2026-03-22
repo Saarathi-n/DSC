@@ -11,6 +11,13 @@ import {
     Monitor,
     Clock,
     Brain,
+    Search,
+    BarChart2,
+    Database,
+    FileText,
+    Zap,
+    User,
+    Bot,
 } from 'lucide-react';
 
 interface ChatMessageProps {
@@ -20,6 +27,7 @@ interface ChatMessageProps {
 
 export function ChatMessage({ message, isStreaming = false }: ChatMessageProps) {
     const [showSteps, setShowSteps] = useState(false);
+    const [showAllActivities, setShowAllActivities] = useState(false);
     const [displayedText, setDisplayedText] = useState('');
     const isUser = message.role === 'user';
     const hasSteps = message.tool_calls && message.tool_calls.length > 0;
@@ -28,6 +36,12 @@ export function ChatMessage({ message, isStreaming = false }: ChatMessageProps) 
     const hasThinking = !isUser && thinkingText.length > 0;
     const rawAssistant = isUser ? message.content : cleanAssistantContent(answerText || message.content);
     const bubbleText = isUser ? rawAssistant : stripLeadingChainOfThought(rawAssistant).trim();
+
+    // Auto-expand steps if there are only a few
+    const autoExpand = hasSteps && message.tool_calls!.length <= 3;
+    useEffect(() => {
+        if (autoExpand) setShowSteps(true);
+    }, [autoExpand]);
 
     useEffect(() => {
         if (!isStreaming || isUser) {
@@ -46,50 +60,84 @@ export function ChatMessage({ message, isStreaming = false }: ChatMessageProps) 
         return () => window.clearInterval(timer);
     }, [bubbleText, isStreaming, isUser]);
 
+    const visibleActivities = showAllActivities
+        ? message.activities!
+        : message.activities?.slice(0, 10);
+
     return (
-        <div className={`flex ${isUser ? 'justify-end' : 'justify-start'} mb-4`}>
-            <div className={`max-w-[85%] ${isUser ? 'order-1' : 'order-1'}`}>
-                {/* Thinking badge — collapsed, no raw content shown */}
+        <div
+            className={`flex gap-3 mb-6 ${isUser ? 'justify-end' : 'justify-start'}`}
+            style={{ animation: 'msgFadeIn 0.25s ease-out' }}
+        >
+            {/* Avatar — assistant only */}
+            {!isUser && (
+                <div className="flex-shrink-0 mt-1">
+                    <div className="w-7 h-7 rounded-full bg-gradient-to-br from-cyan-500/30 to-purple-500/30 border border-cyan-500/30 flex items-center justify-center">
+                        <Bot className="w-3.5 h-3.5 text-cyan-400" />
+                    </div>
+                </div>
+            )}
+
+            <div className={`flex flex-col ${isUser ? 'items-end' : 'items-start'} max-w-[85%]`}>
+
+                {/* Thinking badge */}
                 {hasThinking && (
-                    <div className="mt-1 mb-1 flex items-center gap-1.5 text-xs text-gray-500">
-                        <Brain className="w-3 h-3" />
-                        <span>Thought through the answer</span>
+                    <div className="mb-1.5 flex items-center gap-1.5 text-[11px] text-gray-500 px-1">
+                        <Brain className="w-3 h-3 text-purple-400/70" />
+                        <span className="italic">Reasoned through the answer</span>
                     </div>
                 )}
 
                 {/* Message bubble */}
-                <div
-                    className={`rounded-2xl px-4 py-3 mt-2 ${isUser
-                        ? 'bg-cyan-600 text-white rounded-br-md'
-                        : 'bg-white/5 text-gray-100 rounded-bl-md border border-[#333]'
-                        }`}
-                >
-                    <MarkdownMessage text={isStreaming && !isUser ? displayedText : bubbleText} />
-                    {isStreaming && !isUser && (
-                        <span className="inline-block w-[6px] h-[1em] ml-0.5 align-[-2px] bg-gray-300 animate-pulse" />
-                    )}
-                </div>
+                {isUser ? (
+                    <div className="relative rounded-2xl rounded-br-sm px-4 py-3"
+                        style={{
+                            background: 'linear-gradient(135deg, #0891b2 0%, #0e7490 100%)',
+                            boxShadow: '0 2px 12px rgba(8,145,178,0.25)',
+                        }}
+                    >
+                        <p className="text-sm text-white leading-relaxed whitespace-pre-wrap">{bubbleText}</p>
+                    </div>
+                ) : (
+                    <div
+                        className="relative rounded-2xl rounded-bl-sm px-4 py-3.5"
+                        style={{
+                            background: 'rgba(255,255,255,0.04)',
+                            border: '1px solid rgba(255,255,255,0.08)',
+                            boxShadow: '0 2px 16px rgba(0,0,0,0.4)',
+                            backdropFilter: 'blur(8px)',
+                        }}
+                    >
+                        <MarkdownMessage text={isStreaming && !isUser ? displayedText : bubbleText} />
+                        {isStreaming && !isUser && (
+                            <span className="inline-block w-[5px] h-[14px] ml-0.5 align-[-2px] rounded-sm bg-cyan-400/80 animate-pulse" />
+                        )}
+                    </div>
+                )}
 
-                {/* Agent steps toggle */}
+                {/* Agent steps — vertical timeline */}
                 {hasSteps && (
-                    <div className="mt-2">
+                    <div className="mt-3 w-full">
                         <button
                             onClick={() => setShowSteps(!showSteps)}
-                            className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-gray-200 transition-colors"
+                            className="flex items-center gap-2 text-xs text-gray-400 hover:text-gray-200 transition-colors group mb-2"
                         >
-                            {showSteps ? (
-                                <ChevronDown className="w-3 h-3" />
-                            ) : (
-                                <ChevronRight className="w-3 h-3" />
-                            )}
-                            <Brain className="w-3 h-3" />
-                            <span>{message.tool_calls!.length} agent step{message.tool_calls!.length > 1 ? 's' : ''}</span>
+                            <div className="flex items-center gap-1.5 bg-white/5 border border-white/10 rounded-full px-2.5 py-1 group-hover:border-white/20 transition-all">
+                                <Zap className="w-3 h-3 text-amber-400" />
+                                <span className="font-medium">{message.tool_calls!.length} agent step{message.tool_calls!.length > 1 ? 's' : ''}</span>
+                                {showSteps
+                                    ? <ChevronDown className="w-3 h-3 ml-0.5" />
+                                    : <ChevronRight className="w-3 h-3 ml-0.5" />
+                                }
+                            </div>
                         </button>
 
                         {showSteps && (
-                            <div className="mt-2 space-y-2">
+                            <div className="relative pl-5 space-y-2">
+                                {/* vertical line */}
+                                <div className="absolute left-2 top-2 bottom-2 w-px bg-gradient-to-b from-cyan-500/40 via-purple-500/20 to-transparent" />
                                 {message.tool_calls!.map((step, i) => (
-                                    <AgentStepCard key={i} step={step} />
+                                    <AgentStepCard key={i} step={step} index={i} total={message.tool_calls!.length} />
                                 ))}
                             </div>
                         )}
@@ -98,26 +146,50 @@ export function ChatMessage({ message, isStreaming = false }: ChatMessageProps) 
 
                 {/* Activity references */}
                 {hasActivities && (
-                    <div className="mt-3 space-y-1.5">
-                        <p className="text-xs text-gray-500 font-medium uppercase tracking-wide">Referenced Activities</p>
+                    <div className="mt-3 w-full">
+                        <p className="text-[10px] text-gray-500 font-semibold uppercase tracking-widest mb-2 px-0.5">
+                            Referenced Activities
+                        </p>
                         <div className="flex flex-wrap gap-2">
-                            {message.activities!.slice(0, 8).map((act, i) => (
+                            {visibleActivities!.map((act, i) => (
                                 <ActivityCard key={i} activity={act} />
                             ))}
-                            {message.activities!.length > 8 && (
-                                <span className="text-xs text-gray-500 self-center">
-                                    +{message.activities!.length - 8} more
-                                </span>
-                            )}
                         </div>
+                        {message.activities!.length > 10 && (
+                            <button
+                                onClick={() => setShowAllActivities(!showAllActivities)}
+                                className="mt-2 text-[11px] text-cyan-400/70 hover:text-cyan-400 transition-colors"
+                            >
+                                {showAllActivities
+                                    ? '↑ Show fewer'
+                                    : `+${message.activities!.length - 10} more activities`
+                                }
+                            </button>
+                        )}
                     </div>
                 )}
 
                 {/* Timestamp */}
-                <p className={`text-[10px] mt-1 ${isUser ? 'text-right text-cyan-300' : 'text-gray-500'}`}>
+                <p className={`text-[10px] mt-1.5 px-0.5 ${isUser ? 'text-cyan-300/50' : 'text-gray-600'}`}>
                     {formatTime(message.created_at)}
                 </p>
             </div>
+
+            {/* Avatar — user only */}
+            {isUser && (
+                <div className="flex-shrink-0 mt-1">
+                    <div className="w-7 h-7 rounded-full bg-gradient-to-br from-cyan-600 to-blue-700 flex items-center justify-center">
+                        <User className="w-3.5 h-3.5 text-white" />
+                    </div>
+                </div>
+            )}
+
+            <style>{`
+                @keyframes msgFadeIn {
+                    from { opacity: 0; transform: translateY(6px); }
+                    to   { opacity: 1; transform: translateY(0); }
+                }
+            `}</style>
         </div>
     );
 }
@@ -127,58 +199,84 @@ function MarkdownMessage({ text }: { text: string }) {
         <ReactMarkdown
             remarkPlugins={[remarkGfm]}
             components={{
-                h1: ({ children }) => <h1 className="text-base font-semibold mt-2 mb-1">{children}</h1>,
-                h2: ({ children }) => <h2 className="text-base font-semibold mt-2 mb-1">{children}</h2>,
-                h3: ({ children }) => <h3 className="text-sm font-semibold mt-2 mb-1">{children}</h3>,
-                h4: ({ children }) => <h4 className="text-sm font-medium mt-1 mb-1">{children}</h4>,
-                h5: ({ children }) => <h5 className="text-sm font-medium mt-1 mb-1">{children}</h5>,
-                h6: ({ children }) => <h6 className="text-sm font-medium mt-1 mb-1">{children}</h6>,
-                p: ({ children }) => <p className="text-sm leading-relaxed whitespace-pre-wrap mb-2 last:mb-0">{children}</p>,
-                ul: ({ children }) => <ul className="list-disc pl-5 text-sm my-1 space-y-1">{children}</ul>,
-                ol: ({ children }) => <ol className="list-decimal pl-5 text-sm my-1 space-y-1">{children}</ol>,
-                li: ({ children }) => <li className="leading-relaxed">{children}</li>,
+                h1: ({ children }) => (
+                    <h1 className="text-base font-bold mt-3 mb-1.5 text-white border-l-2 border-cyan-500 pl-2.5">
+                        {children}
+                    </h1>
+                ),
+                h2: ({ children }) => (
+                    <h2 className="text-sm font-semibold mt-3 mb-1.5 text-white border-l-2 border-purple-500/70 pl-2.5">
+                        {children}
+                    </h2>
+                ),
+                h3: ({ children }) => <h3 className="text-sm font-semibold mt-2 mb-1 text-gray-100">{children}</h3>,
+                h4: ({ children }) => <h4 className="text-sm font-medium mt-1.5 mb-1 text-gray-200">{children}</h4>,
+                h5: ({ children }) => <h5 className="text-sm font-medium mt-1 mb-0.5 text-gray-300">{children}</h5>,
+                h6: ({ children }) => <h6 className="text-xs font-medium mt-1 mb-0.5 text-gray-400">{children}</h6>,
+                p: ({ children }) => (
+                    <p className="text-sm leading-relaxed text-gray-200 whitespace-pre-wrap mb-2 last:mb-0">{children}</p>
+                ),
+                ul: ({ children }) => <ul className="list-none pl-0 text-sm my-1.5 space-y-1">{children}</ul>,
+                ol: ({ children }) => <ol className="list-decimal pl-5 text-sm my-1.5 space-y-1 text-gray-200">{children}</ol>,
+                li: ({ children }) => (
+                    <li className="flex gap-2 items-start text-gray-200 leading-relaxed">
+                        <span className="mt-2 w-1.5 h-1.5 rounded-full bg-cyan-500/60 flex-shrink-0" />
+                        <span>{children}</span>
+                    </li>
+                ),
                 a: ({ href, children }) => (
-                    <a href={href} target="_blank" rel="noreferrer" className="text-cyan-300 underline hover:text-cyan-200">
+                    <a href={href} target="_blank" rel="noreferrer" className="text-cyan-400 underline decoration-cyan-400/40 hover:text-cyan-300 hover:decoration-cyan-300/60 transition-colors">
                         {children}
                     </a>
                 ),
                 strong: ({ children }) => <strong className="font-semibold text-white">{children}</strong>,
-                em: ({ children }) => <em className="italic">{children}</em>,
+                em: ({ children }) => <em className="italic text-gray-300">{children}</em>,
                 code: ({ className, children, ...props }) => {
                     const isBlock = !!className;
                     const lang = className?.replace('language-', '') ?? '';
                     if (isBlock) {
                         return (
-                            <code className="block text-xs text-gray-100 whitespace-pre-wrap" data-lang={lang} {...props as object}>
+                            <code className="block text-xs text-gray-100 whitespace-pre-wrap font-mono" data-lang={lang} {...props as object}>
                                 {children}
                             </code>
                         );
                     }
                     return (
-                        <code className="px-1 py-0.5 rounded bg-[#161616]/80 border border-[#333]/50 text-xs text-green-300 font-mono" {...props as object}>
+                        <code className="px-1.5 py-0.5 rounded-md bg-black/40 border border-white/10 text-xs text-emerald-300 font-mono" {...props as object}>
                             {children}
                         </code>
                     );
                 },
                 pre: ({ children }) => (
-                    <div className="relative my-2 group">
-                        <pre className="text-xs bg-[#0a0a0a] border border-[#333]/70 rounded-lg p-3.5 overflow-x-auto whitespace-pre-wrap leading-relaxed">
+                    <div className="relative my-2.5 group">
+                        <div className="absolute inset-0 rounded-xl bg-gradient-to-r from-cyan-500/5 to-purple-500/5 pointer-events-none" />
+                        <pre className="text-xs bg-black/50 border border-white/10 rounded-xl p-4 overflow-x-auto whitespace-pre-wrap leading-relaxed">
                             {children}
                         </pre>
                     </div>
                 ),
                 table: ({ children }) => (
-                    <div className="overflow-x-auto my-2">
-                        <table className="min-w-full text-xs border border-[#333] rounded overflow-hidden">{children}</table>
+                    <div className="overflow-x-auto my-3 rounded-xl border border-white/10">
+                        <table className="min-w-full text-xs">{children}</table>
                     </div>
                 ),
-                thead: ({ children }) => <thead className="bg-[#161616]">{children}</thead>,
-                th: ({ children }) => <th className="px-2 py-1 text-left border-b border-[#333] font-semibold text-white">{children}</th>,
-                td: ({ children }) => <td className="px-2 py-1 align-top border-b border-[#262626] text-gray-200">{children}</td>,
-                blockquote: ({ children }) => (
-                    <blockquote className="border-l-2 border-[#444] pl-3 italic text-gray-300 my-2">{children}</blockquote>
+                thead: ({ children }) => <thead className="bg-white/5">{children}</thead>,
+                th: ({ children }) => (
+                    <th className="px-3 py-2 text-left border-b border-white/10 font-semibold text-gray-200 text-[11px] uppercase tracking-wide">
+                        {children}
+                    </th>
                 ),
-                hr: () => <hr className="border-[#333] my-3" />,
+                td: ({ children }) => (
+                    <td className="px-3 py-2 align-top border-b border-white/5 text-gray-300 even:bg-white/[0.02]">
+                        {children}
+                    </td>
+                ),
+                blockquote: ({ children }) => (
+                    <blockquote className="border-l-[3px] border-cyan-500/50 pl-3.5 my-2 bg-cyan-500/5 rounded-r-lg py-2 italic text-gray-300">
+                        {children}
+                    </blockquote>
+                ),
+                hr: () => <hr className="border-white/10 my-3" />,
             }}
         >
             {text}
@@ -186,37 +284,187 @@ function MarkdownMessage({ text }: { text: string }) {
     );
 }
 
-function cleanAssistantContent(content: string): string {
-    // Step 1: strip [Agent] status lines
-    let text = content.replace(/^\[Agent\].*/gim, '');
+// ─── Tool icon & color map ───
 
-    // Step 2: strip <tool_call> / <tool_response> XML blocks
+function toolMeta(name: string): { icon: React.ReactNode; color: string; label: string } {
+    switch (name) {
+        case 'get_recent_activities':
+        case 'query_activities':
+            return { icon: <Clock className="w-3.5 h-3.5" />, color: '#60a5fa', label: 'Activities' };
+        case 'search_ocr':
+        case 'get_recent_ocr':
+            return { icon: <Monitor className="w-3.5 h-3.5" />, color: '#34d399', label: 'Screen Text' };
+        case 'get_usage_stats':
+            return { icon: <BarChart2 className="w-3.5 h-3.5" />, color: '#fbbf24', label: 'Usage Stats' };
+        case 'get_music_history':
+            return { icon: <Music className="w-3.5 h-3.5" />, color: '#a78bfa', label: 'Music' };
+        case 'get_recent_file_changes':
+            return { icon: <FileText className="w-3.5 h-3.5" />, color: '#f97316', label: 'File Changes' };
+        case 'parallel_search':
+            return { icon: <Search className="w-3.5 h-3.5" />, color: '#e879f9', label: 'Parallel Search' };
+        case 'resolve_query_scope':
+            return { icon: <Zap className="w-3.5 h-3.5" />, color: '#fb923c', label: 'Scope Update' };
+        default:
+            return { icon: <Database className="w-3.5 h-3.5" />, color: '#94a3b8', label: name };
+    }
+}
+
+function AgentStepCard({ step, index, total }: { step: AgentStep; index: number; total: number }) {
+    const [expanded, setExpanded] = useState(false);
+    const { icon, color, label } = toolMeta(step.tool_name);
+
+    const resultSummary = () => {
+        if (!step.tool_result) return 'No result';
+        try {
+            const data = JSON.parse(step.tool_result);
+            if (Array.isArray(data)) return `${data.length} result${data.length !== 1 ? 's' : ''}`;
+            return 'Data received';
+        } catch {
+            const lines = step.tool_result.trim().split('\n');
+            const firstLine = lines[0]?.trim() || '';
+            return firstLine.length > 70 ? firstLine.slice(0, 70) + '…' : firstLine;
+        }
+    };
+
+    return (
+        <div className="relative">
+            {/* timeline dot */}
+            <div
+                className="absolute -left-[17px] top-3 w-2.5 h-2.5 rounded-full border-2 border-[#111] z-10"
+                style={{ backgroundColor: color, boxShadow: `0 0 6px ${color}44` }}
+            />
+            <div
+                className="rounded-xl overflow-hidden border transition-all"
+                style={{ borderColor: expanded ? `${color}33` : 'rgba(255,255,255,0.07)' }}
+            >
+                <button
+                    onClick={() => setExpanded(!expanded)}
+                    className="w-full flex items-center gap-2.5 px-3 py-2.5 text-left hover:bg-white/[0.04] transition-colors"
+                    style={{ background: expanded ? `${color}08` : 'transparent' }}
+                >
+                    <span style={{ color }}>{icon}</span>
+                    <div className="flex-1 min-w-0">
+                        <span className="text-xs font-medium text-gray-200">{label}</span>
+                        <span className="text-[11px] text-gray-500 ml-2">→ {resultSummary()}</span>
+                    </div>
+                    {/* Step number badge */}
+                    <span className="text-[10px] font-bold rounded-full px-1.5 py-0.5 mr-1"
+                        style={{ color, background: `${color}18` }}>
+                        {index + 1}/{total}
+                    </span>
+                    {expanded
+                        ? <ChevronDown className="w-3 h-3 text-gray-500 flex-shrink-0" />
+                        : <ChevronRight className="w-3 h-3 text-gray-500 flex-shrink-0" />
+                    }
+                </button>
+
+                {expanded && (
+                    <div className="px-3 pb-3 space-y-2.5 border-t border-white/5">
+                        {step.reasoning && (
+                            <div className="mt-2.5">
+                                <p className="text-[10px] text-gray-500 uppercase tracking-widest mb-1">Reasoning</p>
+                                <p className="text-xs text-gray-300 italic leading-relaxed">{step.reasoning}</p>
+                            </div>
+                        )}
+                        <div>
+                            <p className="text-[10px] text-gray-500 uppercase tracking-widest mb-1">Arguments</p>
+                            <pre className="text-[11px] text-gray-300 bg-black/40 rounded-lg p-2.5 overflow-x-auto font-mono">
+                                {JSON.stringify(step.tool_args, null, 2)}
+                            </pre>
+                        </div>
+                        <div>
+                            <p className="text-[10px] text-gray-500 uppercase tracking-widest mb-1">Result</p>
+                            <pre className="text-[11px] text-gray-300 bg-black/40 rounded-lg p-2.5 overflow-x-auto max-h-48 overflow-y-auto font-mono">
+                                {(() => {
+                                    try { return JSON.stringify(JSON.parse(step.tool_result), null, 2); }
+                                    catch { return step.tool_result; }
+                                })()}
+                            </pre>
+                        </div>
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+}
+
+function appColor(app: string): string {
+    const a = app.toLowerCase();
+    if (a.includes('vs code') || a.includes('visual studio') || a.includes('cursor')) return '#60a5fa';
+    if (a.includes('brave') || a.includes('chrome') || a.includes('firefox') || a.includes('browser')) return '#f97316';
+    if (a.includes('spotify')) return '#22c55e';
+    if (a.includes('whatsapp')) return '#34d399';
+    if (a.includes('youtube')) return '#ef4444';
+    if (a.includes('obsidian')) return '#a78bfa';
+    if (a.includes('notion')) return '#94a3b8';
+    if (a.includes('terminal') || a.includes('powershell') || a.includes('cmd')) return '#fbbf24';
+    return '#94a3b8';
+}
+
+function ActivityCard({ activity }: { activity: ActivityRef }) {
+    const hasMedia = activity.media && activity.media.title;
+    const color = hasMedia ? '#a78bfa' : appColor(activity.app || '');
+
+    return (
+        <div
+            className="flex items-center gap-2 rounded-xl px-3 py-1.5 transition-all cursor-pointer group"
+            style={{
+                background: `${color}0d`,
+                border: `1px solid ${color}25`,
+                boxShadow: `0 1px 6px ${color}10`,
+            }}
+            onMouseEnter={e => {
+                (e.currentTarget as HTMLDivElement).style.background = `${color}1a`;
+                (e.currentTarget as HTMLDivElement).style.borderColor = `${color}40`;
+                (e.currentTarget as HTMLDivElement).style.transform = 'translateY(-1px)';
+            }}
+            onMouseLeave={e => {
+                (e.currentTarget as HTMLDivElement).style.background = `${color}0d`;
+                (e.currentTarget as HTMLDivElement).style.borderColor = `${color}25`;
+                (e.currentTarget as HTMLDivElement).style.transform = 'translateY(0)';
+            }}
+        >
+            {hasMedia ? (
+                <Music className="w-3.5 h-3.5 flex-shrink-0" style={{ color }} />
+            ) : (
+                <Monitor className="w-3.5 h-3.5 flex-shrink-0" style={{ color }} />
+            )}
+            <div className="min-w-0">
+                <p className="text-xs font-medium truncate max-w-[180px]" style={{ color: '#e2e8f0' }}>
+                    {hasMedia
+                        ? `${activity.media!.title}`
+                        : activity.title || activity.app}
+                </p>
+                <p className="text-[10px] truncate max-w-[180px]" style={{ color: '#64748b' }}>
+                    {hasMedia
+                        ? `${activity.media!.artist || ''} · ${activity.app}`
+                        : `${activity.app} · ${formatTime(activity.time)}`
+                    }
+                </p>
+            </div>
+        </div>
+    );
+}
+
+// ─── Content processing helpers (unchanged) ───
+
+function cleanAssistantContent(content: string): string {
+    let text = content.replace(/^\[Agent\].*/gim, '');
     text = text
         .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
         .replace(/<tool_response>[\s\S]*?<\/tool_response>/gi, '');
-
-    // Step 3: extractAnswerTail — find text after the last closed JSON tool-call block
     const tail = extractAnswerTailFromContent(text);
     if (tail.trim()) {
         text = tail;
     } else {
-        // No clear tail — run full stripToolJsonPayloads on the whole thing
         text = stripToolJsonPayloads(text);
     }
-
-    // Step 4: strip any remaining model-specific delimiters and reasoning JSON fields
     text = stripReasoningLeaks(text);
-
-    // Step 5: strip <AnswerAnswer: ...> style doubled tag artifacts
     text = text.replace(/<th\*{0,4}Answer[^>]*>/gi, '').replace(/<\/th>/gi, '');
-
-    // Step 6: collapse excessive blank lines
     text = text.replace(/\n{3,}/g, '\n\n').trim();
-
     return text;
 }
 
-/** Finds text appearing after the last complete {"tool":...} JSON block in content. */
 function extractAnswerTailFromContent(content: string): string {
     let depth = 0;
     let inString = false;
@@ -238,7 +486,6 @@ function extractAnswerTailFromContent(content: string): string {
             if (depth > 0) {
                 depth--;
                 if (depth === 0) {
-                    // Only treat as a tool block if it contained "tool" key
                     const block = content.slice(content.lastIndexOf('{', i), i + 1);
                     if (block.includes('"tool"') || block.includes('"args"')) {
                         foundToolBlock = true;
@@ -280,7 +527,6 @@ function splitThinkingContent(content: string): { answerText: string; thinkingTe
 }
 
 function sanitizeThinkingText(raw: string): string {
-    // Strip [TOOL_CALL] markers, <tool_call> blocks, [Agent] status lines
     let text = raw
         .replace(/\[TOOL_CALL[^\]]*\][\s\S]*/gi, '')
         .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
@@ -289,21 +535,17 @@ function sanitizeThinkingText(raw: string): string {
         .trim();
     if (!text) return '';
 
-    // If the text contains tool-call JSON patterns (even malformed/partial), suppress it
     const looksLikeToolJson =
         (text.includes('"tool"') || text.includes('"tool":')) &&
         (text.includes('"args"') || text.includes('"args":'));
-    // Also catch partial streaming JSON that starts with { or has bare key fragments
     const looksLikeRawJson =
         /^\s*\{/.test(text) && (text.includes('"tool') || text.includes('"args'));
     if (looksLikeToolJson || looksLikeRawJson) {
-        // Try to salvage a reasoning field if present
         const reasoningMatch = text.match(/"reasoning"\s*:\s*"((?:[^"\\]|\\.)*)"/);
         if (reasoningMatch?.[1]?.trim()) return reasoningMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"').trim();
         return '';
     }
 
-    // Try full JSON parse as last resort
     const candidate = extractJsonObject(text) || text;
     try {
         const parsed = JSON.parse(candidate) as { tool?: string; args?: unknown; reasoning?: string };
@@ -322,7 +564,7 @@ function sanitizeThinkingText(raw: string): string {
         lower.includes('the user ') || lower.includes('user says') ||
         lower.includes('i should') || lower.includes('let me ') ||
         lower.includes('likely they') || lower.includes('we need to') ||
-        lower.includes('then we') || lower.includes('let\'s call') ||
+        lower.includes('then we') || lower.includes("let's call") ||
         lower.includes('tool output') || lower.includes('call get_') ||
         lower.includes('reasoning models');
     if (looksInternal) return 'Analyzing your request and checking the relevant activity data.';
@@ -397,7 +639,6 @@ function stripToolJsonPayloads(text: string): string {
         .replace(/\[\[IF_ACTION:\{[\s\S]*?\}\]\]/gi, '')
         .replace(/<think[^>]*>/gi, '')
         .replace(/<\/think>/gi, '')
-        // Strip [TOOL_CALL ...] markers and everything after on the same line
         .replace(/\[TOOL_CALL[^\]]*\].*/gim, '')
         .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
         .replace(/<tool_response>[\s\S]*?<\/tool_response>/gi, '')
@@ -412,7 +653,6 @@ function stripReasoningLeaks(text: string): string {
     result = result.replace(/^\s*\}\s*$/gm, '');
     result = result.replace(/<\|(?:tool_calls?|function)[^|]*\|>/gi, '');
     result = result.replace(/\n{3,}/g, '\n\n');
-    // Strip inline chain-of-thought reasoning that leaked without <think> tags
     result = stripLeadingChainOfThought(result);
     return result.trim();
 }
@@ -432,7 +672,6 @@ function stripLeadingChainOfThought(text: string): string {
         /^(this doesn't?|it doesn't?) (require|need)/i,
     ];
 
-    // Paragraph-level reasoning patterns — whole paragraphs that are internal monologue
     const paragraphReasoningPatterns = [
         /^(we|i) (have|found|see|can see|note|know|checked|searched)/i,
         /^(we|i) should/i,
@@ -450,7 +689,6 @@ function stripLeadingChainOfThought(text: string): string {
         /^let('?s| me) (also|now|check|verify|look)/i,
     ];
 
-    // Strip paragraph blocks of reasoning (separated by \n\n)
     const paragraphs = text.split(/\n{2,}/);
     let stripParaUntil = 0;
     for (let i = 0; i < paragraphs.length - 1; i++) {
@@ -465,10 +703,8 @@ function stripLeadingChainOfThought(text: string): string {
         ? paragraphs.slice(stripParaUntil).join('\n\n').trim()
         : text;
 
-    // Strip "Thus answer." / "So the answer is:" prefixes before the real answer
     result = result.replace(/^(?:thus answer[.:!]?|so(?:,| the)? answer(?:\s*is)?[.:!]?)\s*/i, '');
 
-    // Strip leading sentences that look like reasoning (single-sentence leaks)
     const parts = result.split(/(?<=[.!?]) *(?=[A-Z*\[#\n])/);
     let stripUntil = 0;
     for (let i = 0; i < parts.length - 1; i++) {
@@ -484,106 +720,4 @@ function stripLeadingChainOfThought(text: string): string {
     }
 
     return result;
-}
-
-function AgentStepCard({ step }: { step: AgentStep }) {
-    const [expanded, setExpanded] = useState(false);
-
-    const toolIcon = () => {
-        switch (step.tool_name) {
-            case 'query_activities': return <Clock className="w-3.5 h-3.5 text-blue-400" />;
-            case 'search_ocr': return <Monitor className="w-3.5 h-3.5 text-green-400" />;
-            case 'get_usage_stats': return <Wrench className="w-3.5 h-3.5 text-yellow-400" />;
-            default: return <Wrench className="w-3.5 h-3.5 text-gray-400" />;
-        }
-    };
-
-    const toolLabel = () => {
-        switch (step.tool_name) {
-            case 'query_activities': return 'Queried Activities';
-            case 'search_ocr': return 'Searched Screen Text';
-            case 'get_usage_stats': return 'Fetched Usage Stats';
-            default: return step.tool_name;
-        }
-    };
-
-    const resultSummary = () => {
-        try {
-            const data = JSON.parse(step.tool_result);
-            if (Array.isArray(data)) return `${data.length} result${data.length !== 1 ? 's' : ''}`;
-            return 'Data received';
-        } catch {
-            return step.tool_result.length > 100 ? `${step.tool_result.substring(0, 100)}...` : step.tool_result;
-        }
-    };
-
-    return (
-        <div className="bg-[#161616] border border-[#333] rounded-lg overflow-hidden">
-            <button
-                onClick={() => setExpanded(!expanded)}
-                className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-white/5 transition-colors"
-            >
-                <div className="flex items-center gap-1.5">
-                    <div className="w-5 h-5 rounded-full bg-white/10 flex items-center justify-center text-[10px] font-bold text-gray-300">
-                        {step.turn}
-                    </div>
-                    {toolIcon()}
-                </div>
-                <div className="flex-1 min-w-0">
-                    <span className="text-xs font-medium text-gray-200">{toolLabel()}</span>
-                    <span className="text-[10px] text-gray-500 ml-2">→ {resultSummary()}</span>
-                </div>
-                {expanded ? <ChevronDown className="w-3 h-3 text-gray-500 flex-shrink-0" /> : <ChevronRight className="w-3 h-3 text-gray-500 flex-shrink-0" />}
-            </button>
-
-            {expanded && (
-                <div className="px-3 pb-3 space-y-2 border-t border-[#333]">
-                    {step.reasoning && (
-                        <div className="mt-2">
-                            <p className="text-[10px] text-gray-500 uppercase tracking-wide mb-0.5">Reasoning</p>
-                            <p className="text-xs text-gray-300 italic">{step.reasoning}</p>
-                        </div>
-                    )}
-                    <div>
-                        <p className="text-[10px] text-gray-500 uppercase tracking-wide mb-0.5">Arguments</p>
-                        <pre className="text-[11px] text-gray-300 bg-[#0a0a0a] rounded p-2 overflow-x-auto">
-                            {JSON.stringify(step.tool_args, null, 2)}
-                        </pre>
-                    </div>
-                    <div>
-                        <p className="text-[10px] text-gray-500 uppercase tracking-wide mb-0.5">Result</p>
-                        <pre className="text-[11px] text-gray-300 bg-[#0a0a0a] rounded p-2 overflow-x-auto max-h-40 overflow-y-auto">
-                            {(() => {
-                                try { return JSON.stringify(JSON.parse(step.tool_result), null, 2); }
-                                catch { return step.tool_result; }
-                            })()}
-                        </pre>
-                    </div>
-                </div>
-            )}
-        </div>
-    );
-}
-
-function ActivityCard({ activity }: { activity: ActivityRef }) {
-    const hasMedia = activity.media && activity.media.title;
-    return (
-        <div className="flex items-center gap-2 bg-white/5 border border-[#333] rounded-lg px-3 py-1.5 hover:bg-white/10 transition-colors cursor-pointer">
-            {hasMedia ? (
-                <Music className="w-3.5 h-3.5 text-green-400 flex-shrink-0" />
-            ) : (
-                <Monitor className="w-3.5 h-3.5 text-blue-400 flex-shrink-0" />
-            )}
-            <div className="min-w-0">
-                <p className="text-xs text-gray-200 font-medium truncate max-w-[200px]">
-                    {hasMedia
-                        ? `${activity.media!.title} – ${activity.media!.artist}`
-                        : activity.title || activity.app}
-                </p>
-                <p className="text-[10px] text-gray-500">
-                    {activity.app} · {formatTime(activity.time)}
-                </p>
-            </div>
-        </div>
-    );
 }

@@ -32,11 +32,12 @@ fn db_get_entries(conn: &rusqlite::Connection, date: Option<&str>) -> Result<Vec
             created_at:      row.get(4)?,
             updated_at:      row.get(5)?,
         })).map_err(|e| e.to_string())?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows.filter_map(|r| r.map_err(|e| eprintln!("[db] diary row error: {e}")).ok()).collect())
     } else {
         let mut stmt = conn.prepare(
             "SELECT id, date, content, is_ai_generated, created_at, updated_at
-             FROM diary_entries ORDER BY date DESC, created_at DESC",
+             FROM diary_entries ORDER BY date DESC, created_at DESC
+             LIMIT 200",
         ).map_err(|e| e.to_string())?;
         let rows = stmt.query_map([], |row| Ok(DiaryEntry {
             id:              row.get(0)?,
@@ -46,14 +47,14 @@ fn db_get_entries(conn: &rusqlite::Connection, date: Option<&str>) -> Result<Vec
             created_at:      row.get(4)?,
             updated_at:      row.get(5)?,
         })).map_err(|e| e.to_string())?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows.filter_map(|r| r.map_err(|e| eprintln!("[db] diary row error: {e}")).ok()).collect())
     }
 }
 
 fn db_gather_generate_context(
     conn: &rusqlite::Connection,
     date: &str,
-) -> Result<(Vec<String>, Option<String>), String> {
+) -> Result<(Vec<String>, Option<String>, String, String), String> {
     use chrono::NaiveDate;
     let d = NaiveDate::parse_from_str(date, "%Y-%m-%d")
         .map_err(|_| "Invalid date format (expected YYYY-MM-DD)".to_string())?;
@@ -74,13 +75,38 @@ fn db_gather_generate_context(
     .filter_map(|r| r.ok())
     .collect();
 
-    let nvidia_api_key = conn.query_row(
-        "SELECT value FROM app_settings WHERE key = 'nvidia_api_key'",
+    // Read the user's configured AI provider and model
+    let ai_provider = conn.query_row(
+        "SELECT value FROM app_settings WHERE key = 'ai_provider'",
         [], |row| row.get::<_, String>(0),
-    ).ok().filter(|s| !s.is_empty())
-    .or_else(|| std::env::var("NVIDIA_API_KEY").ok().filter(|s| !s.is_empty()));
+    ).unwrap_or_else(|_| "nvidia".to_string());
 
-    Ok((apps, nvidia_api_key))
+    let ai_model = conn.query_row(
+        "SELECT value FROM app_settings WHERE key = 'default_model'",
+        [], |row| row.get::<_, String>(0),
+    ).unwrap_or_default();
+
+    // Determine the correct API key based on provider
+    let env_key_name = match ai_provider.to_lowercase().as_str() {
+        "openai" => "openai_api_key",
+        "anthropic" => "anthropic_api_key",
+        "groq" => "groq_api_key",
+        _ => "nvidia_api_key",
+    };
+    let env_var_name = match ai_provider.to_lowercase().as_str() {
+        "openai" => "OPENAI_API_KEY",
+        "anthropic" => "ANTHROPIC_API_KEY",
+        "groq" => "GROQ_API_KEY",
+        _ => "NVIDIA_API_KEY",
+    };
+
+    let api_key = conn.query_row(
+        "SELECT value FROM app_settings WHERE key = ?1",
+        rusqlite::params![env_key_name], |row| row.get::<_, String>(0),
+    ).ok().filter(|s| !s.is_empty())
+    .or_else(|| std::env::var(env_var_name).ok().filter(|s| !s.is_empty()));
+
+    Ok((apps, api_key, ai_model, ai_provider))
 }
 
 // ─── Tauri commands ────────────────────────────────────────────────────────────
@@ -131,10 +157,10 @@ pub async fn diary_generate_entry(
     model: Option<String>,
 ) -> Result<String, String> {
     // Phase 1: sync DB — collect all data into owned Strings, then conn is dropped
-    let (apps, nvidia_api_key) = tokio::task::spawn_blocking({
+    let (apps, api_key, db_model, _ai_provider) = tokio::task::spawn_blocking({
         let app2 = app_handle.clone();
         let date2 = date.clone();
-        move || -> Result<(Vec<String>, Option<String>), String> {
+        move || -> Result<(Vec<String>, Option<String>, String, String), String> {
             let conn = crate::intent::db::open(&app2)?;
             db_gather_generate_context(&conn, &date2)
         }
@@ -147,12 +173,16 @@ pub async fn diary_generate_entry(
     };
 
     // Phase 2: async API call (no Connection held)
-    let model_id = model.as_deref().unwrap_or("meta/llama-3.3-70b-instruct");
+    // Use explicit model > db model > fallback
+    let model_id = model.as_deref()
+        .filter(|s| !s.is_empty())
+        .or_else(|| if db_model.is_empty() { None } else { Some(db_model.as_str()) })
+        .unwrap_or("meta/llama-3.3-70b-instruct");
 
-    let Some(api_key) = nvidia_api_key.clone() else {
+    let Some(key) = api_key else {
         return Ok(format!(
-            "*AI diary generation for model `{}` requires your NVIDIA NIM API key.*\n\n**Activity summary for {}:**\n{}",
-            model_id, date, activity_context
+            "*AI diary generation requires an API key. Set one in Settings.*\n\n**Activity summary for {}:**\n{}",
+            date, activity_context
         ));
     };
 
@@ -169,7 +199,9 @@ pub async fn diary_generate_entry(
     #[derive(Deserialize)] struct Mc   { content: String }
 
     let try_provider = |ep: String, key: String, model_id: String, prompt: String| async move {
-        let resp = reqwest::Client::new()
+        let resp = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build().map_err(|e| e.to_string())?
             .post(ep)
             .header("Authorization", format!("Bearer {}", key))
             .json(&Req {
@@ -194,7 +226,7 @@ pub async fn diary_generate_entry(
 
     let first = try_provider(
         "https://integrate.api.nvidia.com/v1/chat/completions".to_string(),
-        api_key,
+        key,
         model_id.to_string(),
         prompt.clone(),
     ).await;

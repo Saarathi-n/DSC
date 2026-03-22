@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useEditor, EditorContent } from '@tiptap/react';
@@ -37,7 +38,12 @@ import {
   Heading2,
   Quote,
   Square,
-  Trash2
+  Trash2,
+  Cloud,
+  Cpu,
+  Loader2,
+  Minus,
+  Plus
 } from 'lucide-react';
 import { BrainActionType, BrainChatMessage, buildModelConversation, inferActionContentFromResponse, isUiTranscriptNoise, parseActionPayload, runLocalAgenticTools, sanitizeProposedMarkdown, serializeToolRuns } from '../services/brainAiService';
 import { MermaidBlock } from '../components/MermaidBlock';
@@ -251,14 +257,28 @@ export const BrainView: React.FC = () => {
   const [fileContent, setFileContent] = useState<string>('');
   const [isEditing, setIsEditing] = useState(false);
   const [editContent, setEditContent] = useState('');
+
+  // Notes-specific font size (persisted to localStorage)
+  const [notesFontSize, setNotesFontSize] = useState(() => {
+    const stored = localStorage.getItem('brain_notesFontSize');
+    return stored ? Number(stored) : 16;
+  });
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const [showNewFileInput, setShowNewFileInput] = useState(false);
   const [newFileName, setNewFileName] = useState('');
   const [breadcrumbs, setBreadcrumbs] = useState<string[]>([]);
-  const [aiMessages, setAiMessages] = useState<BrainChatMessage[]>([
-    { sender: 'ai', text: 'Welcome to Brain! Select a note from your vault or create a new one. I can help analyze and discuss your notes once you load them.' }
-  ]);
-  const [aiInput, setAiInput] = useState('');
+  const [aiMessages, setAiMessages] = useState<BrainChatMessage[]>(() => {
+    const initialFile = localStorage.getItem('brain_selectedFile');
+    const chatKey = `brain_chat_${initialFile || 'global'}`;
+    const savedChat = localStorage.getItem(chatKey);
+    if (savedChat) {
+      try {
+        return JSON.parse(savedChat);
+      } catch (e) { }
+    }
+    return [{ sender: 'ai', text: 'Welcome to Brain! Select a note from your vault or create a new one. I can help analyze and discuss your notes once you load them.' }];
+  });
+  const chatFileRef = useRef(localStorage.getItem('brain_selectedFile') || 'global');
   const [selectedModel, setSelectedModel] = useState(() => localStorage.getItem(BRAIN_LAST_MODEL_STORAGE_KEY) || DEFAULT_NIM_MODEL);
   const [showModelDropdown, setShowModelDropdown] = useState(false);
   const [modelSearchQuery, setModelSearchQuery] = useState('');
@@ -266,7 +286,15 @@ export const BrainView: React.FC = () => {
   const [aiProvider, setAiProvider] = useState<'nvidia' | 'local' | 'lmstudio'>('nvidia');
   const [nvidiaApiKey, setNvidiaApiKey] = useState('');
   const [modelsLoading, setModelsLoading] = useState(true);
+
+  // Cloud/Local model lists
+  const [lmStudioModels, setLmStudioModels] = useState<{ id: string, name?: string }[]>([]);
+  const [cloudModels, setCloudModels] = useState<{ id: string, name?: string }[]>([]);
+  const [lmStudioLoading, setLmStudioLoading] = useState(false);
+  const [cloudLoading, setCloudLoading] = useState(false);
+  const [lmStudioError, setLmStudioError] = useState<string | null>(null);
   const [isAiLoading, setIsAiLoading] = useState(false);
+  const [streamingMsgIndex, setStreamingMsgIndex] = useState<number | null>(null);
   const [aiMode, setAiMode] = useState<'lecture' | 'edit'>('lecture');
   const [proposedAction, setProposedAction] = useState<{
     type: 'insert' | 'create' | 'replace_selection' | 'insert_at_cursor' | 'find_and_replace' | 'replace_all';
@@ -301,13 +329,14 @@ export const BrainView: React.FC = () => {
     } else {
       setAiMessages([{ sender: 'ai', text: 'Welcome to Brain! Select a note from your vault or create a new one.' }]);
     }
+    chatFileRef.current = selectedFile || 'global';
   }, [selectedFile]);
 
   // Save chat history whenever it updates
   useEffect(() => {
-    const chatKey = `brain_chat_${selectedFile || 'global'}`;
+    const chatKey = `brain_chat_${chatFileRef.current}`;
     localStorage.setItem(chatKey, JSON.stringify(aiMessages));
-  }, [aiMessages, selectedFile]);
+  }, [aiMessages]);
 
   // Prevent applying stale proposals after switching to another note
   useEffect(() => {
@@ -321,13 +350,6 @@ export const BrainView: React.FC = () => {
       }]);
     }
   }, [selectedFile, proposedAction]);
-
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleAiSend();
-    }
-  };
 
   // Ref for the markdown view container
   const markdownContainerRef = useRef<HTMLDivElement>(null);
@@ -378,121 +400,213 @@ export const BrainView: React.FC = () => {
   };
 
 
-  // Sidebar Resizing
+  // Sidebar Resizing — uses refs + direct DOM manipulation for zero-lag dragging
   const [aiPanelWidth, setAiPanelWidth] = useState(380);
   const [isResizing, setIsResizing] = useState(false);
   const sidebarRef = useRef<HTMLDivElement>(null);
+  const aiPanelWidthRef = useRef(380);
+  const isResizingRef = useRef(false);
+  const rafRef = useRef<number | null>(null);
 
-  const startResizing = (e: React.MouseEvent) => {
+  const startResizing = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
+    isResizingRef.current = true;
     setIsResizing(true);
-  };
+    // Prevent text selection during drag
+    document.body.style.userSelect = 'none';
+    document.body.style.cursor = 'col-resize';
+  }, []);
 
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
-      if (!isResizing) return;
-      const newWidth = document.body.clientWidth - e.clientX;
-      if (newWidth > 280 && newWidth < 800) { // Min 280px, Max 800px
-        setAiPanelWidth(newWidth);
-      }
+      if (!isResizingRef.current) return;
+      // Cancel any pending rAF to avoid stacking
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+      rafRef.current = requestAnimationFrame(() => {
+        const newWidth = document.body.clientWidth - e.clientX;
+        if (newWidth > 280 && newWidth < 800) {
+          aiPanelWidthRef.current = newWidth;
+          // Direct DOM update — no React re-render
+          if (sidebarRef.current) {
+            sidebarRef.current.style.width = `${newWidth}px`;
+          }
+        }
+      });
     };
 
     const handleMouseUp = () => {
+      if (!isResizingRef.current) return;
+      isResizingRef.current = false;
       setIsResizing(false);
+      // Commit final width to React state (single re-render)
+      setAiPanelWidth(aiPanelWidthRef.current);
+      // Restore text selection and cursor
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+      if (rafRef.current !== null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
     };
 
-    if (isResizing) {
-      document.addEventListener('mousemove', handleMouseMove);
-      document.addEventListener('mouseup', handleMouseUp);
-    }
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
 
     return () => {
       document.removeEventListener('mousemove', handleMouseMove);
       document.removeEventListener('mouseup', handleMouseUp);
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     };
-  }, [isResizing]);
+  }, []);
 
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Fetch LM Studio models
+  const fetchLMStudioModels = useCallback(async () => {
+    setLmStudioLoading(true);
+    setLmStudioError(null);
+    try {
+      const modelsRaw = await window.nexusAPI?.settings?.getLMStudioModels?.();
+      const normalized = (Array.isArray(modelsRaw) ? modelsRaw : [])
+        .map((m: any) => ({ id: m?.id || String(m), name: m?.name || m?.id || String(m) }))
+        .filter((m: { id: string }) => !!m.id);
+      setLmStudioModels(normalized);
+      setAvailableModels(normalized);
+      if (normalized.length > 0) {
+        const lastModel = localStorage.getItem(`${BRAIN_LAST_MODEL_STORAGE_KEY}_local`) || localStorage.getItem(BRAIN_LAST_MODEL_STORAGE_KEY) || '';
+        const hasLast = normalized.some((m: any) => m.id === lastModel);
+        if (hasLast) {
+          setSelectedModel(lastModel);
+        } else {
+          setSelectedModel(normalized[0].id);
+        }
+      }
+    } catch (err) {
+      console.error('Failed to fetch LM Studio models:', err);
+      setLmStudioError('LM Studio not reachable. Make sure it is running.');
+      setLmStudioModels([]);
+      setAvailableModels([]);
+    } finally {
+      setLmStudioLoading(false);
+      setModelsLoading(false);
+    }
+  }, []);
 
-  // Fetch available models from API
+  // Fetch NVIDIA cloud models
+  const fetchCloudModels = useCallback(async () => {
+    setCloudLoading(true);
+    try {
+      const settings = await window.nexusAPI?.settings?.get?.();
+      const key = settings?.nvidiaApiKey || '';
+      setNvidiaApiKey(key);
+
+      if (!key) {
+        setCloudModels([{ id: DEFAULT_NIM_MODEL, name: DEFAULT_NIM_MODEL }]);
+        setAvailableModels([{ id: DEFAULT_NIM_MODEL, name: DEFAULT_NIM_MODEL }]);
+        return;
+      }
+
+      const modelsRaw = window.nexusAPI?.settings?.getNvidiaModels
+        ? await window.nexusAPI.settings.getNvidiaModels(key)
+        : await (async () => {
+          const response = await fetch('https://integrate.api.nvidia.com/v1/models', {
+            headers: { Authorization: `Bearer ${key}` }
+          });
+          if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`API error (${response.status}): ${errorText.slice(0, 100)}`);
+          }
+          return response.json();
+        })();
+
+      const normalized = (Array.isArray(modelsRaw) ? modelsRaw : (modelsRaw?.data || []))
+        .map((m: any) => ({ id: m?.id || String(m), name: m?.name || m?.id || String(m) }))
+        .filter((m: { id: string }) => !!m.id);
+
+      if (normalized.length > 0) {
+        setCloudModels(normalized);
+        setAvailableModels(normalized);
+        const lastModel = localStorage.getItem(`${BRAIN_LAST_MODEL_STORAGE_KEY}_cloud`) || localStorage.getItem(BRAIN_LAST_MODEL_STORAGE_KEY) || '';
+        const hasLast = normalized.some((m: any) => m.id === lastModel);
+        if (hasLast) {
+          setSelectedModel(lastModel);
+        } else {
+          setSelectedModel(normalized[0].id);
+        }
+      } else {
+        setCloudModels([{ id: DEFAULT_NIM_MODEL, name: DEFAULT_NIM_MODEL }]);
+        setAvailableModels([{ id: DEFAULT_NIM_MODEL, name: DEFAULT_NIM_MODEL }]);
+      }
+    } catch (error) {
+      console.error('Failed to fetch cloud models:', error);
+      setCloudModels([{ id: DEFAULT_NIM_MODEL, name: DEFAULT_NIM_MODEL }]);
+      setAvailableModels([{ id: DEFAULT_NIM_MODEL, name: DEFAULT_NIM_MODEL }]);
+    } finally {
+      setCloudLoading(false);
+      setModelsLoading(false);
+    }
+  }, []);
+
+  // Detect initial provider and fetch models on mount
   useEffect(() => {
-    const fetchModels = async () => {
+    const init = async () => {
       try {
         const settings = await window.nexusAPI?.settings?.get?.();
         const provider = ((settings?.aiProvider || 'nvidia').toLowerCase() as 'nvidia' | 'local' | 'lmstudio');
         const localProvider = provider === 'local' || provider === 'lmstudio';
         setAiProvider(localProvider ? 'lmstudio' : 'nvidia');
-        const key = settings?.nvidiaApiKey || '';
-        setNvidiaApiKey(key);
+        setNvidiaApiKey(settings?.nvidiaApiKey || '');
         const lastModel = localStorage.getItem(BRAIN_LAST_MODEL_STORAGE_KEY) || settings?.defaultModel || DEFAULT_NIM_MODEL;
-
+        setSelectedModel(lastModel);
         if (localProvider) {
-          const modelsRaw = await window.nexusAPI?.settings?.getLMStudioModels?.();
-          const normalized = (Array.isArray(modelsRaw) ? modelsRaw : [])
-            .map((m: any) => ({ id: m?.id || String(m), name: m?.name || m?.id || String(m) }))
-            .filter((m: { id: string }) => !!m.id);
-
-          if (normalized.length > 0) {
-            setAvailableModels(normalized);
-            const hasLastModel = normalized.some((m: { id: string }) => m.id === lastModel);
-            setSelectedModel(hasLastModel ? lastModel : normalized[0].id);
-          } else {
-            setAvailableModels([{ id: lastModel, name: lastModel }]);
-            setSelectedModel(lastModel);
-          }
-          return;
-        }
-
-        if (!key) {
-          setAvailableModels([{ id: DEFAULT_NIM_MODEL, name: DEFAULT_NIM_MODEL }]);
-          setSelectedModel(lastModel);
-          return;
-        }
-
-        const modelsRaw = window.nexusAPI?.settings?.getNvidiaModels
-          ? await window.nexusAPI.settings.getNvidiaModels(key)
-          : await (async () => {
-            const response = await fetch('https://integrate.api.nvidia.com/v1/models', {
-              headers: { Authorization: `Bearer ${key}` }
-            });
-            if (!response.ok) {
-              const errorText = await response.text();
-              throw new Error(`API error (${response.status}): ${errorText.slice(0, 100)}`);
-            }
-            return response.json();
-          })();
-
-        const normalized = (Array.isArray(modelsRaw) ? modelsRaw : (modelsRaw?.data || []))
-          .map((m: any) => ({ id: m?.id || String(m), name: m?.name || m?.id || String(m) }))
-          .filter((m: { id: string }) => !!m.id);
-
-        if (normalized.length > 0) {
-          setAvailableModels(normalized);
-          const hasLastModel = normalized.some((m: { id: string }) => m.id === lastModel);
-          if (hasLastModel) {
-            setSelectedModel(lastModel);
-          } else {
-            setSelectedModel(normalized[0].id);
-          }
+          fetchLMStudioModels();
         } else {
-          setAvailableModels([{ id: DEFAULT_NIM_MODEL, name: DEFAULT_NIM_MODEL }]);
-          setSelectedModel(lastModel);
+          fetchCloudModels();
         }
       } catch (error) {
-        console.error('Failed to fetch models:', error);
+        console.error('Failed to init models:', error);
         setAvailableModels([{ id: DEFAULT_NIM_MODEL, name: DEFAULT_NIM_MODEL }]);
         setSelectedModel(localStorage.getItem(BRAIN_LAST_MODEL_STORAGE_KEY) || DEFAULT_NIM_MODEL);
-      } finally {
         setModelsLoading(false);
       }
     };
-    fetchModels();
-  }, []);
+    init();
+  }, [fetchLMStudioModels, fetchCloudModels]);
+
+  // Switch provider at runtime
+  const switchProvider = useCallback((mode: 'nvidia' | 'lmstudio') => {
+    setAiProvider(mode);
+    setModelsLoading(true);
+    if (mode === 'lmstudio') {
+      if (lmStudioModels.length > 0) {
+        setAvailableModels(lmStudioModels);
+        const lastLocal = localStorage.getItem(`${BRAIN_LAST_MODEL_STORAGE_KEY}_local`) || lmStudioModels[0]?.id || '';
+        const hasLocal = lmStudioModels.some(m => m.id === lastLocal);
+        setSelectedModel(hasLocal ? lastLocal : (lmStudioModels[0]?.id || ''));
+        setModelsLoading(false);
+      } else {
+        fetchLMStudioModels();
+      }
+    } else {
+      if (cloudModels.length > 0) {
+        setAvailableModels(cloudModels);
+        const lastCloud = localStorage.getItem(`${BRAIN_LAST_MODEL_STORAGE_KEY}_cloud`) || cloudModels[0]?.id || '';
+        const hasCloud = cloudModels.some(m => m.id === lastCloud);
+        setSelectedModel(hasCloud ? lastCloud : (cloudModels[0]?.id || ''));
+        setModelsLoading(false);
+      } else {
+        fetchCloudModels();
+      }
+    }
+  }, [lmStudioModels, cloudModels, fetchLMStudioModels, fetchCloudModels]);
 
   useEffect(() => {
     if (!selectedModel?.trim()) return;
-    localStorage.setItem(BRAIN_LAST_MODEL_STORAGE_KEY, selectedModel);
-  }, [selectedModel]);
+    if (aiProvider === 'lmstudio' || aiProvider === 'local') {
+      localStorage.setItem(`${BRAIN_LAST_MODEL_STORAGE_KEY}_local`, selectedModel);
+    } else {
+      localStorage.setItem(`${BRAIN_LAST_MODEL_STORAGE_KEY}_cloud`, selectedModel);
+    }
+    localStorage.setItem(BRAIN_LAST_MODEL_STORAGE_KEY, selectedModel); // Legacy fallback
+  }, [selectedModel, aiProvider]);
 
   // Load file tree on mount
   useEffect(() => {
@@ -502,10 +616,27 @@ export const BrainView: React.FC = () => {
     }
   }, [vaultPath]);
 
-  const loadFileTree = async () => {
+  const loadFileTree = async (force = false) => {
     if (!window.nexusAPI?.notes) return;
+    // Use cached tree if available and recent (<30s old)
+    const cacheKey = `__notesTreeCache_${vaultPath}`;
+    const cached = (window as any)[cacheKey];
+    if (!force && cached && Date.now() - cached.ts < 30000) {
+      // Only update state if cached tree differs from current (avoids re-render)
+      setFileTree(prev => {
+        if (prev.length === cached.tree.length && JSON.stringify(prev) === JSON.stringify(cached.tree)) return prev;
+        return cached.tree;
+      });
+      return;
+    }
+    // Fetch fresh tree in the background — do NOT blank the old tree
     const tree = await window.nexusAPI.notes.getFileTree(vaultPath);
-    setFileTree(tree);
+    (window as any)[cacheKey] = { tree, ts: Date.now() };
+    // Only update React state if the tree actually changed
+    setFileTree(prev => {
+      if (prev.length === tree.length && JSON.stringify(prev) === JSON.stringify(tree)) return prev;
+      return tree;
+    });
   };
 
   const selectVault = async () => {
@@ -652,12 +783,12 @@ export const BrainView: React.FC = () => {
   const clearChat = () => {
     setAiMessages([{ sender: 'ai', text: 'Chat cleared. How can I help you with this note?' }]);
     // Clear persistence immediately
-    const chatKey = `brain_chat_${selectedFile || 'global'}`;
+    const chatKey = `brain_chat_${chatFileRef.current}`;
     localStorage.removeItem(chatKey);
   };
 
-    const handleAiSend = async () => {
-    if (!aiInput.trim() || isAiLoading) return;
+  const handleAiSend = async (messageText: string) => {
+    if (!messageText.trim() || isAiLoading) return;
 
     if (aiProvider === 'nvidia' && !nvidiaApiKey) {
       setAiMessages(prev => [...prev, {
@@ -669,14 +800,13 @@ export const BrainView: React.FC = () => {
 
     abortControllerRef.current = new AbortController();
 
-    const userMessage = aiInput.trim();
+    const userMessage = messageText.trim();
     const usedContext = selectedContext;
     const usedRange = selectionRange;
     const usedTiptapRange = tiptapRange;
     const wasEditing = isEditing;
 
     setAiMessages(prev => [...prev, { sender: 'user', text: userMessage, context: usedContext || undefined }]);
-    setAiInput('');
     setSelectedContext('');
     setTiptapRange(null);
     setSelectionRange(null);
@@ -706,10 +836,10 @@ export const BrainView: React.FC = () => {
 
       const systemPrompt = aiMode === 'edit'
         ? `You are Nexus AI, an editor assistant with an orchestration layer.\n\nMODE:\nEDIT MODE: return precise edit actions.\n\nYou are given local tool results (line extraction, keyword search, RAG chunks). Use those results first; do not hallucinate unseen content.\n\nOutput rules:\n- Always include ONE JSON object at the end of the response.\n- Wrap the JSON in <nexus_action_json>...</nexus_action_json> tags.\n- JSON action must be one of: insert_content, create_note, replace_selection, insert_at_cursor, find_and_replace, replace_all.\n- For find_and_replace, include exact target_text from tool/line context.\n- For any edit action, content must be non-empty and must be the exact insertion text.\n- For replace_all, content must be the complete final note.\n- Also include the same insertion body in <nexus_content>...</nexus_content> tags.\n- Do not duplicate sections or repeat algorithm steps; output one clean final version.\n- Keep explanation short and concrete.\n\nJSON schema:\n<nexus_action_json>\n{\n  "action": "find_and_replace",\n  "target_text": "exact text",\n  "content": "replacement",\n  "explanation": "why"\n}\n</nexus_action_json>\n\nOptional content mirror:\n<nexus_content>\nreplacement\n</nexus_content>\n\nSelection constraints:\n${isSelectionActive
-            ? (wasEditing
-                ? 'User selected text in editor. Prefer replace_selection.'
-                : 'User selected text in rendered view. Prefer find_and_replace with exact raw markdown target_text.')
-            : 'No explicit selection. Use insert_at_cursor for additions; use replace_all only for full rewrites.'}`
+          ? (wasEditing
+            ? 'User selected text in editor. Prefer replace_selection.'
+            : 'User selected text in rendered view. Prefer find_and_replace with exact raw markdown target_text.')
+          : 'No explicit selection. Use insert_at_cursor for additions; use replace_all only for full rewrites.'}`
         : `You are Nexus AI, a teaching assistant with an orchestration layer.\n\nMODE:\nLECTURE MODE: teach only.\n\nYou are given local tool results (line extraction, keyword search, RAG chunks). Use those results first; do not hallucinate unseen content.\n\nOutput rules:\n- Explain and teach in plain markdown.\n- Do NOT output any JSON object.\n- Do NOT output <nexus_action_json> or <nexus_content> tags.\n- Do NOT propose file edits, replacements, or apply/discard style actions.\n- Keep the response instructional, concrete, and structured.`;
 
       const fallbackModel = availableModels[0]?.id || DEFAULT_NIM_MODEL;
@@ -717,102 +847,79 @@ export const BrainView: React.FC = () => {
         ? selectedModel
         : fallbackModel;
 
-      const callModel = async (modelId: string) => {
+
+      // --- Build messages for model ---
+      const buildMessages = (modelId: string) => {
         const convoContext = buildModelConversation(aiMessages, aiMode);
-        const messages = [
+        return [
           { role: 'system', content: systemPrompt },
           ...convoContext,
           { role: 'user', content: `${userMessage}\n\nCONTEXT:\n${noteContext}` }
         ];
-
-        if (aiProvider === 'local' || aiProvider === 'lmstudio') {
-          if (window.nexusAPI?.settings?.lmstudioChatCompletion) {
-            return await window.nexusAPI.settings.lmstudioChatCompletion(
-              modelId,
-              messages,
-              65536,
-              aiMode === 'edit' ? 0.15 : 0.45,
-            );
-          }
-
-          const response = await fetch('http://127.0.0.1:1234/v1/chat/completions', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              model: modelId,
-              messages,
-              stream: false,
-              max_tokens: 65536,
-              temperature: aiMode === 'edit' ? 0.15 : 0.45,
-            }),
-            signal: abortControllerRef.current?.signal
-          });
-
-          if (!response.ok) {
-            const errorText = await response.text().catch(() => 'Unknown API error');
-            throw new Error(`Local API error (${response.status}) on ${modelId}: ${errorText.slice(0, 220)}`);
-          }
-
-          return response.json();
-        }
-
-        if (window.nexusAPI?.settings?.nvidiaChatCompletion) {
-          return await window.nexusAPI.settings.nvidiaChatCompletion(
-            modelId,
-            messages,
-            65536,
-            aiMode === 'edit' ? 0.15 : 0.45,
-          );
-        }
-
-        const response = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${nvidiaApiKey}`
-          },
-          body: JSON.stringify({
-            model: modelId,
-            messages,
-            stream: false,
-            max_tokens: 65536
-          }),
-          signal: abortControllerRef.current?.signal
-        });
-
-        if (!response.ok) {
-          const errorText = await response.text().catch(() => 'Unknown API error');
-          throw new Error(`API error (${response.status}) on ${modelId}: ${errorText.slice(0, 220)}`);
-        }
-
-        return response.json();
       };
 
-      let data: any;
-      try {
-        data = await callModel(effectiveModel);
-      } catch (firstError: any) {
-        const msg = String(firstError?.message || '').toLowerCase();
-        const shouldRetryWithFallback = effectiveModel !== fallbackModel && (
-          msg.includes('unknown model') ||
-          msg.includes('model not found') ||
-          msg.includes('does not exist') ||
-          msg.includes('unknown provider') ||
-          msg.includes('400')
-        );
+      // --- TRUE STREAMING via Rust backend (brain://token events) ---
+      // This mirrors exactly how ChatPage works: the Rust command makes the HTTP request
+      // (no CORS) and emits brain://token for each SSE chunk. We listen and append tokens
+      // to the bubble live — genuine token-by-token streaming.
+      let aiResponse = '';
+      let msgIdx = -1;
 
-        if (shouldRetryWithFallback) {
-          setSelectedModel(fallbackModel);
-          data = await callModel(fallbackModel);
-        } else {
-          throw firstError;
-        }
+      setAiMessages(prev => {
+        const newMsg: BrainChatMessage = { sender: 'ai' as const, text: '' };
+        const next = [...prev, newMsg];
+        msgIdx = next.length - 1;
+        return next;
+      });
+      setTimeout(() => setStreamingMsgIndex(msgIdx), 0);
+
+      const isLocal = aiProvider === 'local' || aiProvider === 'lmstudio';
+      const msgs = buildMessages(effectiveModel);
+
+      // Listen for tokens before calling so we don't miss any
+      const unlistenToken = await listen<string>('brain://token', (event) => {
+        aiResponse += event.payload;
+        setAiMessages(prev => {
+          const next = [...prev];
+          const msg = next[msgIdx];
+          if (msg && msg.sender === 'ai') {
+            next[msgIdx] = { ...msg, text: msg.text + event.payload };
+          }
+          return next;
+        });
+      });
+
+      const unlistenDone = await listen<string>('brain://done', () => {
+        setStreamingMsgIndex(null);
+      });
+
+      try {
+        await window.nexusAPI!.settings!.brainChatStream!(
+          effectiveModel,
+          msgs,
+          isLocal,
+          65536,
+          aiMode === 'edit' ? 0.15 : 0.45,
+        );
+      } catch (err: any) {
+        // Remove the empty bubble on error
+        setAiMessages(prev => prev.filter((_, i) => i !== msgIdx));
+        throw err;
+      } finally {
+        unlistenToken();
+        unlistenDone();
       }
 
-      const aiResponse = data.choices?.[0]?.message?.content || 'Sorry, I could not generate a response.';
-      setAiMessages(prev => [...prev, { sender: 'ai', text: aiResponse }]);
+      if (!aiResponse.trim()) {
+        aiResponse = 'Sorry, I could not generate a response.';
+        setAiMessages(prev => {
+          const next = [...prev];
+          if (next[msgIdx]) next[msgIdx] = { ...next[msgIdx], text: aiResponse };
+          return next;
+        });
+      }
+      setStreamingMsgIndex(null);
+
 
       if (aiMode !== 'edit') {
         setProposedAction(null);
@@ -844,7 +951,7 @@ export const BrainView: React.FC = () => {
 
         const replaceAllTarget = (actionData.target_text || currentEditorContent || fileContent || editContent || '').toString();
         setProposedAction({
-          type: actionData.action === 'insert_content' ? 'insert' : actionData.action,
+          type: actionData.action === 'insert_content' ? 'insert' : (actionData.action === 'create_note' ? 'create' : actionData.action) as any,
           content: resolvedContent,
           target_text: actionData.action === 'replace_all' ? replaceAllTarget : (actionData.target_text || usedContext),
           originalSelection: usedContext || undefined,
@@ -1153,7 +1260,7 @@ export const BrainView: React.FC = () => {
           </div>
 
           <div className="flex items-center gap-1 p-2 border-t border-[#262626]">
-            <button onClick={loadFileTree} className="p-1.5 hover:bg-[#262626] rounded text-gray-500 hover:text-white" title="Refresh">
+            <button onClick={() => loadFileTree(true)} className="p-1.5 hover:bg-[#262626] rounded text-gray-500 hover:text-white" title="Refresh">
               <RefreshCw size={14} />
             </button>
             <button onClick={() => { setShowNewFileInput(true); setShowNewFolderInput(false); }} className="p-1.5 hover:bg-[#262626] rounded text-gray-500 hover:text-white" title="New Note">
@@ -1200,6 +1307,28 @@ export const BrainView: React.FC = () => {
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
+            {/* Notes font size controls */}
+            {selectedFile && (
+              <div className="flex items-center gap-0.5 mr-1">
+                <button
+                  onClick={() => setNotesFontSize(prev => { const v = Math.max(12, prev - 1); localStorage.setItem('brain_notesFontSize', String(v)); return v; })}
+                  className="p-1 hover:bg-[#262626] rounded text-gray-500 hover:text-white transition-colors"
+                  title="Decrease font size"
+                  disabled={notesFontSize <= 12}
+                >
+                  <Minus size={12} />
+                </button>
+                <span className="text-[10px] text-gray-500 font-mono w-7 text-center select-none">{notesFontSize}</span>
+                <button
+                  onClick={() => setNotesFontSize(prev => { const v = Math.min(28, prev + 1); localStorage.setItem('brain_notesFontSize', String(v)); return v; })}
+                  className="p-1 hover:bg-[#262626] rounded text-gray-500 hover:text-white transition-colors"
+                  title="Increase font size"
+                  disabled={notesFontSize >= 28}
+                >
+                  <Plus size={12} />
+                </button>
+              </div>
+            )}
             {selectedFile && (
               <>
                 {isEditing ? (
@@ -1227,7 +1356,7 @@ export const BrainView: React.FC = () => {
           </div>
         </div>
 
-        <div className="flex-1 overflow-y-auto custom-scrollbar bg-[#0a0a0a]">
+        <div className="flex-1 overflow-y-auto custom-scrollbar bg-[#0a0a0a]" style={{ fontSize: `${notesFontSize}px` }}>
           {selectedFile ? (
             <div className="w-full h-full">
               {isEditing ? (
@@ -1261,7 +1390,8 @@ export const BrainView: React.FC = () => {
       {isAiPanelOpen && (
         <div
           onMouseDown={startResizing}
-          className={`w-1 hover:w-1 bg-[#262626] hover:bg-purple-500/50 cursor-col-resize z-50 transition-colors ${isResizing ? 'bg-purple-500' : ''}`}
+          className={`w-1 hover:w-1.5 bg-[#262626] hover:bg-purple-500/50 cursor-col-resize z-50 transition-colors duration-150 ${isResizing ? 'bg-purple-500 w-1.5' : ''}`}
+          style={{ touchAction: 'none' }}
         />
       )}
 
@@ -1269,7 +1399,7 @@ export const BrainView: React.FC = () => {
       {isAiPanelOpen && (
         <div
           ref={sidebarRef}
-          style={{ width: aiPanelWidth }}
+          style={{ width: aiPanelWidth, willChange: isResizing ? 'width' : 'auto' }}
           className="bg-[#161616] border-l border-[#262626] flex flex-col shrink-0 animate-in slide-in-from-right-10 duration-200"
         >
           <div className="h-12 flex items-center justify-between px-5 border-b border-[#262626]">
@@ -1327,18 +1457,59 @@ export const BrainView: React.FC = () => {
             {/* Model Selector */}
             <div className="mb-4 relative">
               <h4 className="text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2">Model</h4>
+
+              {/* Cloud / Local Toggle */}
+              <div className="flex p-1 bg-[#0a0a0a] rounded-lg border border-[#262626] mb-2">
+                <button
+                  onClick={() => switchProvider('nvidia')}
+                  className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-md text-xs font-medium transition-all ${aiProvider === 'nvidia' ? 'bg-[#262626] text-blue-400' : 'text-gray-500 hover:text-gray-300'}`}
+                >
+                  <Cloud size={13} />
+                  Cloud
+                </button>
+                <button
+                  onClick={() => switchProvider('lmstudio')}
+                  className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-md text-xs font-medium transition-all ${aiProvider === 'lmstudio' || aiProvider === 'local' ? 'bg-[#262626] text-emerald-400' : 'text-gray-500 hover:text-gray-300'}`}
+                >
+                  <Cpu size={13} />
+                  Local
+                </button>
+              </div>
+
               <button
                 onClick={() => setShowModelDropdown(!showModelDropdown)}
                 className="w-full flex items-center justify-between px-3 py-2 bg-[#262626] border border-[#333] rounded text-sm text-gray-300 hover:border-purple-500/40 transition-colors"
               >
-                <span className="truncate">{selectedModel || 'Select model...'}</span>
-                <ChevronDown size={14} className={`transition-transform ${showModelDropdown ? 'rotate-180' : ''}`} />
+                <div className="flex items-center gap-1.5 truncate">
+                  {aiProvider === 'lmstudio' || aiProvider === 'local' ? (
+                    <Cpu size={13} className="text-emerald-400 shrink-0" />
+                  ) : (
+                    <Cloud size={13} className="text-blue-400 shrink-0" />
+                  )}
+                  <span className="truncate">{selectedModel || 'Select model...'}</span>
+                </div>
+                <ChevronDown size={14} className={`transition-transform shrink-0 ${showModelDropdown ? 'rotate-180' : ''}`} />
               </button>
 
               {showModelDropdown && (
                 <div className="absolute z-20 w-full mt-1 bg-[#1a1a1a] border border-[#333] rounded-lg shadow-xl max-h-72 overflow-y-auto">
+                  {/* Header for local mode */}
+                  {(aiProvider === 'lmstudio' || aiProvider === 'local') && (
+                    <div className="sticky top-0 bg-[#1a1a1a] border-b border-[#333] px-3 py-2 flex items-center justify-between">
+                      <div className="min-w-0">
+                        <p className="text-[10px] font-semibold text-emerald-400 uppercase tracking-wider">LM Studio Models</p>
+                        <p className={`text-[10px] ${lmStudioError ? 'text-red-400' : 'text-gray-500'}`}>
+                          {lmStudioError ? 'Offline' : lmStudioModels.length > 0 ? `${lmStudioModels.length} loaded` : 'Online'}
+                        </p>
+                      </div>
+                      <button onClick={fetchLMStudioModels} className="text-gray-400 hover:text-white transition-colors p-1" title="Refresh">
+                        {lmStudioLoading ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+                      </button>
+                    </div>
+                  )}
+
                   {/* Search Input */}
-                  <div className="sticky top-0 bg-[#1a1a1a] border-b border-[#333] p-2">
+                  <div className="sticky top-0 bg-[#1a1a1a] border-b border-[#333] p-2" style={(aiProvider === 'lmstudio' || aiProvider === 'local') ? { position: 'relative' } : {}}>
                     <input
                       type="text"
                       value={modelSearchQuery}
@@ -1348,8 +1519,20 @@ export const BrainView: React.FC = () => {
                       autoFocus
                     />
                   </div>
-                  {modelsLoading ? (
-                    <div className="px-3 py-2 text-sm text-gray-500">Loading models...</div>
+
+                  {/* Error for local models */}
+                  {(aiProvider === 'lmstudio' || aiProvider === 'local') && lmStudioError && (
+                    <div className="px-3 py-3 text-center">
+                      <p className="text-xs text-red-400">{lmStudioError}</p>
+                      <p className="text-[10px] text-gray-500 mt-1">Make sure LM Studio is running with the server enabled</p>
+                    </div>
+                  )}
+
+                  {modelsLoading || lmStudioLoading || cloudLoading ? (
+                    <div className="px-3 py-3 flex items-center justify-center gap-2">
+                      <Loader2 size={14} className="animate-spin text-purple-400" />
+                      <span className="text-sm text-gray-500">Loading models...</span>
+                    </div>
                   ) : (
                     availableModels
                       .filter(model => {
@@ -1361,9 +1544,14 @@ export const BrainView: React.FC = () => {
                         <button
                           key={model.id}
                           onClick={() => { setSelectedModel(model.id); setShowModelDropdown(false); setModelSearchQuery(''); }}
-                          className={`w-full text-left px-3 py-2 text-sm hover:bg-[#262626] transition-colors ${selectedModel === model.id ? 'bg-purple-900/30 text-purple-300' : 'text-gray-300'}`}
+                          className={`w-full flex items-center gap-2 text-left px-3 py-2 text-sm hover:bg-[#262626] transition-colors ${selectedModel === model.id ? 'bg-purple-900/30 text-purple-300' : 'text-gray-300'}`}
                         >
-                          {model.name || model.id}
+                          {(aiProvider === 'lmstudio' || aiProvider === 'local') ? (
+                            <Cpu size={13} className="shrink-0 text-emerald-400/60" />
+                          ) : (
+                            <Cloud size={13} className="shrink-0 text-blue-400/60" />
+                          )}
+                          <span className="truncate">{model.name || model.id}</span>
                         </button>
                       ))
                   )}
@@ -1387,9 +1575,17 @@ export const BrainView: React.FC = () => {
             {/* Chat History */}
             <div className="flex-1 overflow-y-auto flex flex-col gap-4 mb-4 pr-1 custom-scrollbar">
               {aiMessages.map((msg, i) => (
-                <ChatBubble key={i} sender={msg.sender} text={msg.text} context={msg.context} isAction={msg.isAction} />
+                <ChatBubble
+                  key={i}
+                  sender={msg.sender}
+                  text={msg.text}
+                  context={msg.context}
+                  isAction={msg.isAction}
+                  isStreaming={i === streamingMsgIndex}
+                  onStreamingDone={() => { if (i === streamingMsgIndex) setStreamingMsgIndex(null); }}
+                />
               ))}
-              {isAiLoading && (
+              {isAiLoading && aiMessages[aiMessages.length - 1]?.sender !== 'ai' && (
                 <div className="flex items-start">
                   <div className="bg-gradient-to-br from-purple-900/20 to-blue-900/10 text-gray-400 rounded-2xl rounded-tl-sm border border-purple-500/10 px-3 py-2 text-sm">
                     <span className="animate-pulse">Thinking...</span>
@@ -1469,31 +1665,64 @@ export const BrainView: React.FC = () => {
           )}
 
           {/* Input Area */}
-          <div className="p-4 bg-[#161616]">
-            <div className="relative bg-[#0a0a0a] border border-[#262626] rounded-xl focus-within:border-purple-500/50 transition-colors">
-              <textarea
-                value={aiInput}
-                onChange={(e) => setAiInput(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder={`Ask Nexus about ${selectedFile ? 'this note' : 'your notes'}...`}
-                className="w-full bg-transparent border-none text-sm text-gray-200 p-3 pr-12 outline-none resize-none h-12 min-h-[48px] max-h-32 custom-scrollbar"
-                style={{ height: '48px' }} // Dynamic height handling typically needs a ref/effect
-              />
-              <button
-                onClick={isAiLoading ? handleStopAi : handleAiSend}
-                disabled={!isAiLoading && !aiInput.trim()}
-                className={`absolute right-2 top-2 p-2 rounded-lg text-white transition-all shadow-lg shadow-purple-900/20 ${isAiLoading ? 'bg-red-500 hover:bg-red-600' : 'bg-purple-600 hover:bg-purple-500 disabled:opacity-50 disabled:cursor-not-allowed'}`}
-                title={isAiLoading ? "Stop generation" : "Send message"}
-              >
-                {isAiLoading ? <Square size={16} fill="currentColor" /> : <Send size={16} />}
-              </button>
-            </div>
-            <div className="mt-2 text-[10px] text-center text-gray-600">
-              Nexus AI can make mistakes. Review generated actions.
-            </div>
-          </div>
+          <ChatInputBox
+            onSend={handleAiSend}
+            onStop={handleStopAi}
+            isLoading={isAiLoading}
+            placeholder={`Ask Nexus about ${selectedFile ? 'this note' : 'your notes'}...`}
+          />
         </div>
       )}
+    </div>
+  );
+};
+
+const ChatInputBox: React.FC<{
+  onSend: (message: string) => void;
+  onStop: () => void;
+  isLoading: boolean;
+  placeholder: string;
+}> = ({ onSend, onStop, isLoading, placeholder }) => {
+  const [input, setInput] = useState('');
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+
+  const handleSend = () => {
+    if (!input.trim() || isLoading) return;
+    onSend(input);
+    setInput('');
+  };
+
+  return (
+    <div className="p-4 bg-[#161616]">
+      <div className="relative bg-[#0a0a0a] border border-[#262626] rounded-xl focus-within:border-purple-500/50 transition-colors">
+        <textarea
+          ref={textareaRef}
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={handleKeyDown}
+          placeholder={placeholder}
+          className="w-full bg-transparent border-none text-sm text-gray-200 p-3 pr-12 outline-none resize-none h-12 min-h-[48px] max-h-32 custom-scrollbar"
+          style={{ height: '48px' }}
+        />
+        <button
+          onClick={isLoading ? onStop : handleSend}
+          disabled={!isLoading && !input.trim()}
+          className={`absolute right-2 top-2 p-2 rounded-lg text-white transition-all shadow-lg shadow-purple-900/20 ${isLoading ? 'bg-red-500 hover:bg-red-600' : 'bg-purple-600 hover:bg-purple-500 disabled:opacity-50 disabled:cursor-not-allowed'}`}
+          title={isLoading ? "Stop generation" : "Send message"}
+        >
+          {isLoading ? <Square size={16} fill="currentColor" /> : <Send size={16} />}
+        </button>
+      </div>
+      <div className="mt-2 text-[10px] text-center text-gray-600">
+        Nexus AI can make mistakes. Review generated actions.
+      </div>
     </div>
   );
 };
@@ -1813,12 +2042,20 @@ const MarkdownRendererImpl: React.FC<MarkdownRendererProps> = ({ content, onChec
 const MarkdownRenderer = React.memo(MarkdownRendererImpl);
 MarkdownRenderer.displayName = 'MarkdownRenderer';
 
-const ChatBubble: React.FC<{ sender: 'ai' | 'user'; text: string; context?: string; isAction?: boolean }> = ({ sender, text, context, isAction }) => {
+const ChatBubbleImpl: React.FC<{
+  sender: 'ai' | 'user';
+  text: string;
+  context?: string;
+  isAction?: boolean;
+  isStreaming?: boolean;
+  onStreamingDone?: () => void;
+}> = ({ sender, text, context, isAction, isStreaming = false, onStreamingDone }) => {
   const [isThinkExpanded, setIsThinkExpanded] = React.useState(false);
 
-  // Parse for <think> tags
-  const thinkMatch = text.match(/<think>([\s\S]*?)<\/think>/);
-  const thinkContent = thinkMatch ? thinkMatch[1] : null;
+  // Parse for <think> tags — handle attributes (e.g. <think reasoning>), both closed and unclosed blocks
+  const thinkMatchClosed = text.match(/<think[^>]*>([\s\S]*?)<\/think>/i);
+  const thinkMatchUnclosed = !thinkMatchClosed ? text.match(/<think[^>]*>([\s\S]*)/i) : null;
+  let taggedThinking = thinkMatchClosed ? thinkMatchClosed[1] : (thinkMatchUnclosed ? thinkMatchUnclosed[1] : null);
 
   // If this message resulted in a successfully parsed action, we completely hide the raw text.
   // We still allow 'thinkContent' if DeepSeek or others generated thoughts before acting.
@@ -1826,8 +2063,12 @@ const ChatBubble: React.FC<{ sender: 'ai' | 'user'; text: string; context?: stri
     text = "Action proposed.";
   }
 
-  // Remove <think> tags and JSON action blocks from display just in case
-  let cleanText = text.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+  // Remove <think> tags (both closed and unclosed, with optional attributes) and JSON action blocks
+  let cleanText = text
+    .replace(/<think[^>]*>[\s\S]*?<\/think>/gi, '')
+    .replace(/<think[^>]*>[\s\S]*/gi, '')
+    .replace(/<\/think>/gi, '')
+    .trim();
 
   // Hide all JSON blocks, even unclosed ones (common when Kimi runs out of tokens or forgets backticks)
   if (!isAction) {
@@ -1836,10 +2077,63 @@ const ChatBubble: React.FC<{ sender: 'ai' | 'user'; text: string; context?: stri
     cleanText = cleanText.replace(/\{\s*"action"[\s\S]*?$/ig, '').trim();
   }
 
-  // If the message was entirely a JSON action and we stripped it, don't show an empty bubble.
-  if (cleanText === '' && sender === 'ai') {
-    cleanText = "Done.";
+  // --- Heuristic chain-of-thought detection for models that don't use <think> tags ---
+  // Detects leading paragraphs that look like internal reasoning and diverts them
+  // into the collapsible "Thinking Process" dropdown.
+  let heuristicThinking = '';
+  if (sender === 'ai' && cleanText && !taggedThinking) {
+    const paragraphReasoningPatterns = [
+      /^(we|i) (have|found|see|can see|note|know|checked|searched|need|want|will|must|should)/i,
+      /^the (evidence|data|result|ocr|activity|context|snippet|search|user|selected)/i,
+      /^(looking|searching|checking|scanning|analyzing|reviewing|proceed)/i,
+      /^provide (evidence|a bullet|the bullet|an answer)/i,
+      /^also (note|remember|verify|check)/i,
+      /^(so|therefore|thus),? (we|i|the answer|it|answer)/i,
+      /^based on (the|this|our|that)/i,
+      /^(it (seems|looks|appears)|this means|this indicates)/i,
+      /^let('?s| me| us) /i,
+      /^(this is|these are) (a |the )?(section|from|part|about|table|content|note|document)/i,
+      /^proceed\.?$/i,
+      /^(keep it|use plain|no json|no hallucin)/i,
+      /^(explain|summarize|structure|format|answer)/i,
+    ];
+
+    const paragraphs = cleanText.split(/\n{2,}/);
+    let stripUntil = 0;
+    for (let i = 0; i < paragraphs.length; i++) {
+      const para = paragraphs[i].trim();
+      // Stop if this is the last paragraph (always keep at least one)
+      if (i >= paragraphs.length - 1) break;
+      if (paragraphReasoningPatterns.some(p => p.test(para))) {
+        stripUntil = i + 1;
+      } else {
+        break;
+      }
+    }
+    if (stripUntil > 0) {
+      heuristicThinking = paragraphs.slice(0, stripUntil).join('\n\n').trim();
+      cleanText = paragraphs.slice(stripUntil).join('\n\n').trim();
+    }
   }
+
+  // Combine tagged and heuristic thinking
+  const thinkContent = [taggedThinking, heuristicThinking].filter(Boolean).join('\n\n').trim() || null;
+
+  // If the message was entirely thinking and/or JSON, show a friendlier message
+  // But not while actively streaming — show nothing (blank) so only the cursor shows
+  if (cleanText === '' && sender === 'ai' && !isStreaming) {
+    cleanText = thinkContent ? 'Thinking complete — expand above to see reasoning.' : 'Done.';
+  }
+
+  // --- Animation for completed (non-streaming) messages only ---
+  // During active streaming, tokens already arrive live via brain://token events.
+  // Replaying them through the char animation just adds lag on top of real streaming.
+  // After streaming is done (isStreaming goes false), show the full text immediately.
+
+  // The displayed text:
+  // - During streaming: show all received text immediately (token IS the animation)
+  // - After streaming: show full cleanText
+  const displayedText = cleanText;
 
   return (
     <div className={`flex flex-col ${sender === 'user' ? 'items-end' : 'items-start'} max-w-[95%]`}>
@@ -1873,12 +2167,100 @@ const ChatBubble: React.FC<{ sender: 'ai' | 'user'; text: string; context?: stri
 
       {/* Main Message */}
       <div className={`
-        rounded-2xl px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap
+        rounded-2xl px-4 py-3 text-sm leading-relaxed
         ${sender === 'user'
-          ? 'bg-[#262626] text-gray-200 rounded-tr-sm border border-[#333]'
-          : 'bg-gradient-to-br from-purple-900/20 to-blue-900/10 text-gray-300 rounded-tl-sm border border-purple-500/10'}
+          ? 'bg-[#262626] text-gray-200 rounded-tr-sm border border-[#333] whitespace-pre-wrap'
+          : 'bg-gradient-to-br from-purple-900/20 to-blue-900/10 text-gray-300 rounded-tl-sm border border-purple-500/10 chat-md-bubble'}
       `}>
-        {cleanText || (thinkContent ? <span className="italic text-gray-500">Thinking complete.</span> : text)}
+        {sender === 'ai' ? (
+          displayedText ? (
+            <>
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                components={{
+                  h1: ({ children }) => <h1 className="text-base font-bold text-white mt-3 mb-1.5">{children}</h1>,
+                  h2: ({ children }) => <h2 className="text-[15px] font-bold text-white mt-3 mb-1.5">{children}</h2>,
+                  h3: ({ children }) => <h3 className="text-sm font-semibold text-white mt-2.5 mb-1">{children}</h3>,
+                  h4: ({ children }) => <h4 className="text-sm font-medium text-gray-200 mt-2 mb-1">{children}</h4>,
+                  h5: ({ children }) => <h5 className="text-sm font-medium text-gray-200 mt-1.5 mb-1">{children}</h5>,
+                  h6: ({ children }) => <h6 className="text-sm font-medium text-gray-300 mt-1.5 mb-1">{children}</h6>,
+                  p: ({ children }) => <p className="text-sm leading-relaxed mb-2 last:mb-0">{children}</p>,
+                  ul: ({ children }) => <ul className="list-disc pl-5 text-sm my-1.5 space-y-0.5">{children}</ul>,
+                  ol: ({ children }) => <ol className="list-decimal pl-5 text-sm my-1.5 space-y-0.5">{children}</ol>,
+                  li: ({ children }) => <li className="leading-relaxed">{children}</li>,
+                  a: ({ href, children }) => (
+                    <a href={href} target="_blank" rel="noreferrer" className="text-purple-300 underline hover:text-purple-200 transition-colors">
+                      {children}
+                    </a>
+                  ),
+                  strong: ({ children }) => <strong className="font-semibold text-white">{children}</strong>,
+                  em: ({ children }) => <em className="italic text-gray-400">{children}</em>,
+                  code: ({ className, children, ...props }) => {
+                    const codeText = String(children).replace(/\n$/, '');
+                    const mermaidByClass = !!className && className.includes('language-mermaid');
+                    const mermaidByContent = looksLikeMermaid(codeText);
+                    if (mermaidByClass || mermaidByContent) {
+                      return <MermaidBlock chart={codeText} />;
+                    }
+                    const isBlock = !!className;
+                    if (isBlock) {
+                      return (
+                        <code className="block text-xs text-gray-200 whitespace-pre-wrap" {...props as object}>
+                          {children}
+                        </code>
+                      );
+                    }
+                    return (
+                      <code className="px-1 py-0.5 rounded bg-[#1a1a1a] border border-[#333]/60 text-xs text-purple-300 font-mono" {...props as object}>
+                        {children}
+                      </code>
+                    );
+                  },
+                  pre: ({ children }) => {
+                    const child = React.Children.only(children) as React.ReactElement<{ className?: string; children?: React.ReactNode }> | undefined;
+                    const preClassName = child?.props?.className || '';
+                    const preCodeText = typeof child?.props?.children === 'string'
+                      ? child.props.children
+                      : Array.isArray(child?.props?.children)
+                        ? child?.props?.children.join('')
+                        : '';
+                    if (preClassName.includes('language-mermaid') || looksLikeMermaid(preCodeText)) {
+                      return <MermaidBlock chart={preCodeText} />;
+                    }
+                    return (
+                      <div className="relative my-2">
+                        <pre className="text-xs bg-[#0d0d0d] border border-[#333]/70 rounded-lg p-3 overflow-x-auto whitespace-pre-wrap leading-relaxed">
+                          {children}
+                        </pre>
+                      </div>
+                    );
+                  },
+                  table: ({ children }) => (
+                    <div className="overflow-x-auto my-2">
+                      <table className="min-w-full text-xs border border-[#333] rounded overflow-hidden">{children}</table>
+                    </div>
+                  ),
+                  thead: ({ children }) => <thead className="bg-[#1a1a1a]">{children}</thead>,
+                  th: ({ children }) => <th className="px-2 py-1 text-left border-b border-[#333] font-semibold text-white">{children}</th>,
+                  td: ({ children }) => <td className="px-2 py-1 align-top border-b border-[#262626] text-gray-300">{children}</td>,
+                  blockquote: ({ children }) => (
+                    <blockquote className="border-l-2 border-purple-500/50 pl-3 italic text-gray-400 my-2">{children}</blockquote>
+                  ),
+                  hr: () => <hr className="border-[#333] my-3" />,
+                }}
+              >
+                {displayedText}
+              </ReactMarkdown>
+              {(isStreaming && sender === 'ai') && (
+                <span className="inline-block w-[5px] h-[14px] ml-0.5 align-[-2px] bg-purple-400/80 rounded-sm animate-pulse" />
+              )}
+            </>
+          ) : (
+            thinkContent ? <span className="italic text-gray-500">Thinking complete.</span> : text
+          )
+        ) : (
+          cleanText || (thinkContent ? <span className="italic text-gray-500">Thinking complete.</span> : text)
+        )}
       </div>
 
       <span className="text-[10px] text-gray-600 mt-1 px-1 select-none">
@@ -1887,6 +2269,8 @@ const ChatBubble: React.FC<{ sender: 'ai' | 'user'; text: string; context?: stri
     </div>
   );
 };
+
+const ChatBubble = React.memo(ChatBubbleImpl);
 
 
 

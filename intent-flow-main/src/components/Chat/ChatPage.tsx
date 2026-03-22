@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import type { ChatSession, ChatMessage as ChatMessageType } from '../../lib/chatTypes';
+import type { ChatSession, ChatMessage as ChatMessageType } from '../../types';
 import {
     createChatSession,
     getChatSessions,
@@ -9,7 +9,7 @@ import {
     getNvidiaModels,
     getLMStudioModels,
     type ModelInfo,
-} from '../../services/chatService';
+} from '../../services/tauri';
 import { ChatMessage } from './ChatMessage';
 import {
     Send,
@@ -31,6 +31,7 @@ import {
     Zap,
     Clock,
     BarChart2,
+    Music2,
     Star,
     Sun,
     Calendar as CalendarIcon,
@@ -133,7 +134,9 @@ interface ParsedAssistantAction {
 function parseAssistantAction(content: string): ParsedAssistantAction {
     const marker = /\[\[IF_ACTION:(\{[\s\S]*\})\]\]/m;
     const match = content.match(marker);
-    if (!match) return { cleanedContent: content, action: null };
+    if (!match) {
+        return { cleanedContent: content, action: null };
+    }
     let action: ConfirmActionPayload | null = null;
     try {
         action = JSON.parse(match[1]) as ConfirmActionPayload;
@@ -150,37 +153,6 @@ function loadSelectedModelFromStorage(): string {
     } catch {
         return '';
     }
-}
-
-/** Returns all text that comes after the last complete JSON tool-call block. */
-function extractAnswerTail(content: string): string {
-    let depth = 0;
-    let inString = false;
-    let escape = false;
-    let lastClosedAt = -1;
-
-    for (let i = 0; i < content.length; i++) {
-        const ch = content[i];
-        if (inString) {
-            if (escape) { escape = false; continue; }
-            if (ch === '\\') { escape = true; continue; }
-            if (ch === '"') inString = false;
-            continue;
-        }
-        if (ch === '"') { inString = true; continue; }
-        if (ch === '{') { depth++; continue; }
-        if (ch === '}') {
-            if (depth > 0) {
-                depth--;
-                if (depth === 0) lastClosedAt = i;
-            }
-            continue;
-        }
-    }
-
-    if (lastClosedAt < 0) return content; // no JSON block found — all text
-    const tail = content.slice(lastClosedAt + 1).replace(/^[\s,\[\]]+/, '').trim();
-    return tail;
 }
 
 export function ChatPage({ initialPrompt }: ChatPageProps) {
@@ -294,7 +266,7 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
         setModelMode(isLocal ? 'local' : 'cloud');
     }, [settings?.ai.provider]);
 
-    // Auto-fetch models when mode changes
+    // Auto-fetch models when mode changes (mirrors CodeView/BrainView fetchModels useEffect)
     useEffect(() => {
         if (modelMode === 'local') {
             fetchLMStudioModels();
@@ -330,6 +302,7 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
         if (initialPrompt && !initialPromptHandled.current && !isSending) {
             initialPromptHandled.current = true;
             setInput(initialPrompt);
+            // Auto-send after a short delay to let state settle
             setTimeout(() => {
                 handleSendWithMessage(initialPrompt);
             }, 300);
@@ -353,34 +326,26 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
 
     // Listen for streaming tokens
     useEffect(() => {
-        let cancelled = false;
-        const unlisteners: Array<() => void> = [];
-
+        let unlistenToken: (() => void) | undefined;
+        let unlistenStatus: (() => void) | undefined;
+        let unlistenDone: (() => void) | undefined;
         async function setupListener() {
-            const unlistenToken = await listen<string>('chat://token', (event) => {
-                if (!cancelled) setStreamingContent((prev) => prev + event.payload);
+            unlistenToken = await listen<string>('chat://token', (event) => {
+                setStreamingContent((prev) => prev + event.payload);
             });
-            const unlistenStatus = await listen<string>('chat://status', (event) => {
-                if (!cancelled) setAgentStatus(event.payload || '');
+            unlistenStatus = await listen<string>('chat://status', (event) => {
+                setAgentStatus(event.payload || '');
             });
-            const unlistenDone = await listen<string>('chat://done', () => {
-                if (!cancelled) {
-                    setAgentStatus('');
-                    setDisplayedStatus('');
-                }
+            unlistenDone = await listen<string>('chat://done', () => {
+                setAgentStatus('');
+                setDisplayedStatus('');
             });
-            if (cancelled) {
-                unlistenToken();
-                unlistenStatus();
-                unlistenDone();
-            } else {
-                unlisteners.push(unlistenToken, unlistenStatus, unlistenDone);
-            }
         }
         setupListener();
         return () => {
-            cancelled = true;
-            unlisteners.forEach((fn) => fn());
+            if (unlistenToken) unlistenToken();
+            if (unlistenStatus) unlistenStatus();
+            if (unlistenDone) unlistenDone();
         };
     }, []);
 
@@ -393,7 +358,9 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
         const timer = window.setInterval(() => {
             i = Math.min(i + 1, agentStatus.length);
             setDisplayedStatus(agentStatus.slice(0, i));
-            if (i >= agentStatus.length) window.clearInterval(timer);
+            if (i >= agentStatus.length) {
+                window.clearInterval(timer);
+            }
         }, 12);
         return () => window.clearInterval(timer);
     }, [agentStatus]);
@@ -503,7 +470,7 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
             if (action?.kind === 'confirm_scope_or_sources') {
                 setPendingAction(action);
             }
-            loadSessions();
+            loadSessions(); // Refresh sessions to update titles
         } catch (error) {
             console.error('Failed to send message:', error);
             const errorMsg: ChatMessageType = {
@@ -541,75 +508,43 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
 
     const renderStreamingMessage = () => {
         if (!streamingContent) return null;
-
-        // Extract the answer text that appears AFTER all tool-call JSON blocks.
-        // This fixes the bug where accumulated content starts with '{' and the
-        // looksLikeToolJson check stays true even after synthesis text begins.
-        const answerTail = extractAnswerTail(streamingContent);
-
-        // Check whether the TAIL of the stream still looks like in-progress JSON
-        const tail200 = streamingContent.slice(-200);
-
-        // Count open vs closed braces to detect an unclosed (in-progress) JSON block.
-        // If opens > closes, the block hasn't finished streaming yet.
-        const openBraces = (streamingContent.match(/\{/g) || []).length;
-        const closeBraces = (streamingContent.match(/\}/g) || []).length;
-        const hasUnclosedJsonBlock = streamingContent.trimStart().startsWith('{') && openBraces > closeBraces;
-
-        const stillInToolPhase =
-            (answerTail.trim().length === 0 || hasUnclosedJsonBlock) && (
-                tail200.includes('"tool"') ||
-                tail200.includes('"args"') ||
-                tail200.includes('"reasoning"') ||
-                tail200.includes('<|tool_') ||
-                tail200.includes('tool_call_') ||
-                // unclosed JSON block in progress (even if no keywords seen yet)
-                hasUnclosedJsonBlock
-            );
-
-        const toolLabel = (name: string | null): string => {
-            if (!name) return 'Analyzing your activity...';
-            if (name.includes('ocr') || name.includes('screen')) return 'Searching screen activity';
-            if (name.includes('recent') || name.includes('activity')) return 'Fetching recent activity';
-            if (name.includes('music') || name.includes('media')) return 'Checking media history';
-            if (name.includes('browser') || name.includes('web')) return 'Searching browser history';
-            if (name.includes('file') || name.includes('doc')) return 'Scanning files';
-            if (name.includes('usage') || name.includes('stat')) return 'Gathering usage stats';
-            return `Running ${name.replace(/_/g, ' ')}`;
-        };
-
-        if (stillInToolPhase) {
-            // Show the last tool name being called
-            const toolNameMatch = streamingContent.match(/\"tool\"\s*:\s*\"([^\"]+)\"/g);
-            const lastToolMatch = toolNameMatch?.[toolNameMatch.length - 1]?.match(/\"tool\"\s*:\s*\"([^\"]+)\"/);
-            const rawTool = lastToolMatch?.[1] || null;
+        const normalized = streamingContent.trim();
+        const looksLikeToolJson =
+            normalized.startsWith('{') ||
+            normalized.startsWith(', "reasoning"') ||
+            streamingContent.includes('"tool"') ||
+            streamingContent.includes('"args"') ||
+            streamingContent.includes('"reasoning"') ||
+            streamingContent.includes('<|tool_') ||
+            streamingContent.includes('tool_call_');
+        if (looksLikeToolJson) {
+            const toolNameMatch = streamingContent.match(/"tool"\s*:\s*"([^"]+)"/);
+            const reasoningMatch = streamingContent.match(/"reasoning"\s*:\s*"([\s\S]*?)"/);
+            const toolName = toolNameMatch?.[1] || 'tool';
+            const reasoningText = reasoningMatch?.[1]
+                ?.replace(/\\"/g, '"')
+                ?.replace(/\\n/g, '\n')
+                ?.trim();
             return (
-                <div className="flex gap-3 mb-6 justify-start">
-                    <div className="flex-shrink-0 mt-1">
-                        <div className="w-7 h-7 rounded-full flex items-center justify-center"
-                            style={{ background: 'linear-gradient(135deg, rgba(6,182,212,0.25) 0%, rgba(168,85,247,0.25) 100%)', border: '1px solid rgba(6,182,212,0.3)' }}>
-                            <div className="w-3 h-3 rounded-full border-2 border-cyan-400/70 border-t-transparent animate-spin" />
+                <div className="flex justify-start mb-4 animate-pulse">
+                    <div className="max-w-[85%] bg-white/5 rounded-2xl rounded-bl-md px-4 py-3 border border-[#333]">
+                        <div className="flex items-center gap-2 text-cyan-400 mb-2">
+                            <Bot className="w-4 h-4" />
+                            <span className="text-sm font-medium">Thinking</span>
                         </div>
-                    </div>
-                    <div className="rounded-2xl rounded-bl-sm px-4 py-3 flex items-center gap-3"
-                        style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)' }}>
-                        <div className="flex items-end gap-[3px]">
-                            <span className="w-1 rounded-full bg-cyan-400 animate-bounce" style={{height: '8px', animationDelay: '0ms'}} />
-                            <span className="w-1 rounded-full bg-cyan-400 animate-bounce" style={{height: '12px', animationDelay: '150ms'}} />
-                            <span className="w-1 rounded-full bg-purple-400 animate-bounce" style={{height: '8px', animationDelay: '300ms'}} />
+                        <div className="text-xs text-gray-300 space-y-1">
+                            {reasoningText && <p className="whitespace-pre-wrap">{reasoningText}</p>}
+                            <p className="text-gray-400">Running `{toolName}`...</p>
                         </div>
-                        <span className="text-sm text-gray-300">{toolLabel(rawTool)}</span>
                     </div>
                 </div>
             );
         }
-
-        // Synthesis phase — stream the answer text
         const tempMsg: ChatMessageType = {
             id: -1,
             session_id: activeSessionId || '',
             role: 'assistant',
-            content: answerTail || streamingContent,
+            content: streamingContent,
             created_at: Date.now() / 1000,
         };
         return <ChatMessage message={tempMsg} isStreaming={true} />;
@@ -674,11 +609,20 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
         const nextSources = Array.from(
             new Set([...(selectedSources || []), ...(pendingAction.enable_sources || [])])
         );
-        if (pendingAction.suggested_time_range) setSelectedTimeRange(nextTimeRange);
-        if ((pendingAction.enable_sources || []).length > 0) setSelectedSources(nextSources);
+
+        if (pendingAction.suggested_time_range) {
+            setSelectedTimeRange(nextTimeRange);
+        }
+        if ((pendingAction.enable_sources || []).length > 0) {
+            setSelectedSources(nextSources);
+        }
+
         const retryMessage = pendingAction.retry_message || input.trim();
         setPendingAction(null);
-        await handleSendWithMessage(retryMessage, { timeRange: nextTimeRange, sources: nextSources });
+        await handleSendWithMessage(retryMessage, {
+            timeRange: nextTimeRange,
+            sources: nextSources,
+        });
     };
 
     const formatSessionDate = (timestamp: number) => {
@@ -785,7 +729,7 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
                             ) : (
                                 <>
                                     <div className="px-3 py-2 border-b border-[#333]/50">
-                                        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Cloud Models</p>
+                                        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Cloud Models (Chat Only)</p>
                                         <div className="mt-2 relative">
                                             <Search className="w-3.5 h-3.5 text-gray-500 absolute left-2 top-1.5" />
                                             <input
@@ -878,7 +822,8 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
                                     onClick={() => toggleSource(source.id)}
                                     className="w-full flex items-center gap-2.5 px-3 py-2 text-left text-sm hover:bg-white/10 transition-colors"
                                 >
-                                    <div className={`w-4 h-4 rounded border flex items-center justify-center flex-shrink-0 transition-colors ${selectedSources.includes(source.id) ? 'bg-blue-500 border-blue-500' : 'border-[#444] bg-transparent'}`}>
+                                    <div className={`w-4 h-4 rounded border flex items-center justify-center flex-shrink-0 transition-colors ${selectedSources.includes(source.id) ? 'bg-blue-500 border-blue-500' : 'border-[#444] bg-transparent'
+                                        }`}>
                                         {selectedSources.includes(source.id) && <Check className="w-3 h-3 text-white" />}
                                     </div>
                                     <span className={`text-xs ${selectedSources.includes(source.id) ? 'text-white' : 'text-gray-300'}`}>
@@ -913,7 +858,8 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
                                 <button
                                     key={range.id}
                                     onClick={() => { setSelectedTimeRange(range.id); setShowTimeDropdown(false); }}
-                                    className={`w-full flex items-center gap-2 px-3 py-2 text-left text-sm hover:bg-white/10 transition-colors ${selectedTimeRange === range.id ? 'text-blue-400' : 'text-gray-200'}`}
+                                    className={`w-full flex items-center gap-2 px-3 py-2 text-left text-sm hover:bg-white/10 transition-colors ${selectedTimeRange === range.id ? 'text-blue-400' : 'text-gray-200'
+                                        }`}
                                 >
                                     <span className="flex-1 text-xs">{range.label}</span>
                                     {selectedTimeRange === range.id && <Check className="w-3.5 h-3.5 text-blue-400" />}
@@ -924,6 +870,16 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
                 </div>
             </div>
 
+            {/* Send */}
+            <button
+                onClick={handleSend}
+                disabled={!input.trim() || isSending}
+                className="flex items-center gap-1.5 px-4 py-2 rounded-full bg-white/5 border border-[#333]/50 text-gray-200 hover:text-white hover:border-[#444] disabled:opacity-30 disabled:hover:text-gray-200 transition-colors"
+                id="chat-send"
+            >
+                {isSending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+                <span className="text-xs font-medium">Send</span>
+            </button>
         </div>
     );
 
@@ -932,6 +888,7 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
             {/* Chat History Panel */}
             {showHistory && (
                 <div className="w-64 flex-shrink-0 bg-[#0d0f12]/90 border-r border-[#1f2329] flex flex-col">
+                    {/* History Header */}
                     <div className="flex items-center justify-between px-3 py-3 border-b border-[#1f2329]">
                         <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider">History</span>
                         <div className="flex items-center gap-1">
@@ -952,16 +909,15 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
                         </div>
                     </div>
 
-                    <div className="flex-1 overflow-y-auto py-2">
+                    {/* Session List */}
+                    <div className="flex-1 overflow-y-auto py-1">
                         {sessions.length === 0 ? (
                             <div className="px-3 py-8 text-center">
-                                <div className="w-10 h-10 rounded-xl bg-white/5 flex items-center justify-center mx-auto mb-3">
-                                    <MessageSquare className="w-5 h-5 text-gray-600" />
-                                </div>
+                                <MessageSquare className="w-8 h-8 text-gray-700 mx-auto mb-2" />
                                 <p className="text-xs text-gray-500">No conversations yet</p>
                                 <button
                                     onClick={handleNewSession}
-                                    className="mt-3 text-xs text-cyan-400/70 hover:text-cyan-400 transition-colors"
+                                    className="mt-3 text-xs text-cyan-400 hover:text-cyan-300 transition-colors"
                                 >
                                     Start your first chat
                                 </button>
@@ -971,24 +927,23 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
                                 <button
                                     key={session.id}
                                     onClick={() => setActiveSessionId(session.id)}
-                                    className={`group w-full flex items-start gap-2 px-3 py-2.5 text-left transition-all ${
-                                        activeSessionId === session.id
-                                            ? 'bg-cyan-500/10 border-l-2 border-cyan-500/60'
-                                            : 'border-l-2 border-transparent hover:bg-white/[0.04]'
-                                    }`}
+                                    className={`group w-full flex items-start gap-2 px-3 py-2.5 text-left transition-colors ${activeSessionId === session.id
+                                            ? 'bg-white/10 text-white'
+                                            : 'text-gray-300 hover:bg-white/5 hover:text-gray-200'
+                                        }`}
                                 >
-                                    <MessageSquare className="w-3.5 h-3.5 mt-0.5 flex-shrink-0 text-gray-600" />
+                                    <span className="w-3.5 h-3.5 mt-0.5 rounded-[3px] border border-[#39414b] bg-transparent flex-shrink-0" />
                                     <div className="flex-1 min-w-0">
-                                        <p className={`text-xs font-medium truncate ${activeSessionId === session.id ? 'text-white' : 'text-gray-300'}`}>
+                                        <p className="text-xs font-medium truncate">
                                             {session.title || 'New Chat'}
                                         </p>
-                                        <p className="text-[10px] text-gray-600 mt-0.5">
+                                        <p className="text-[10px] text-gray-500 mt-0.5">
                                             {formatSessionDate(session.updated_at)}
                                         </p>
                                     </div>
                                     <button
                                         onClick={(e) => handleDeleteSession(session.id, e)}
-                                        className="opacity-0 group-hover:opacity-100 flex-shrink-0 w-5 h-5 flex items-center justify-center rounded text-gray-600 hover:text-red-400 transition-all"
+                                        className="opacity-0 group-hover:opacity-100 flex-shrink-0 w-6 h-6 flex items-center justify-center rounded text-gray-500 hover:text-red-400 hover:bg-white/10 transition-all"
                                         title="Delete"
                                     >
                                         <Trash2 className="w-3 h-3" />
@@ -1002,6 +957,7 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
 
             {/* Main Chat Area */}
             <div className="flex-1 flex flex-col min-w-0">
+                {/* Top: History toggle if hidden */}
                 {!showHistory && (
                     <div className="px-4 py-2 flex-shrink-0">
                         <button
@@ -1016,39 +972,35 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
 
                 {hasMessages ? (
                     <>
+                        {/* Messages */}
                         <div className="flex-1 overflow-y-auto px-6 py-4">
                             <div className="max-w-3xl mx-auto">
                                 {messages.map((msg) => (
                                     <ChatMessage key={msg.id} message={msg} />
                                 ))}
                                 {streamingContent ? renderStreamingMessage() : isSending && (
-                                    <div className="flex gap-3 mb-6 justify-start">
-                                        <div className="flex-shrink-0 mt-1">
-                                            <div className="w-7 h-7 rounded-full flex items-center justify-center"
-                                                style={{ background: 'linear-gradient(135deg, rgba(6,182,212,0.2) 0%, rgba(168,85,247,0.2) 100%)', border: '1px solid rgba(6,182,212,0.25)' }}>
-                                                <div className="w-3 h-3 rounded-full border-2 border-cyan-400/60 border-t-transparent animate-spin" />
-                                            </div>
-                                        </div>
-                                        <div className="rounded-2xl rounded-bl-sm px-4 py-3"
-                                            style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)' }}>
+                                    <div className="flex items-center gap-2 text-gray-400 mb-4">
+                                        <div className="bg-white/5 rounded-2xl rounded-bl-md px-4 py-3 border border-[#333]">
                                             <div className="flex items-center gap-2">
-                                                <span className="text-sm text-gray-300">
-                                                    {displayedStatus || agentStatus || 'Thinking'}
-                                                </span>
-                                                <span className="inline-flex gap-0.5">
-                                                    <span className="w-1 h-1 rounded-full bg-gray-400 animate-bounce" style={{animationDelay:'0ms'}} />
-                                                    <span className="w-1 h-1 rounded-full bg-gray-400 animate-bounce" style={{animationDelay:'120ms'}} />
-                                                    <span className="w-1 h-1 rounded-full bg-gray-400 animate-bounce" style={{animationDelay:'240ms'}} />
+                                                <Loader2 className="w-4 h-4 animate-spin" />
+                                                <span className="text-sm">
+                                                    {displayedStatus || agentStatus || 'Thinking...'}
+                                                    <span className="inline-flex ml-1">
+                                                        <span className="animate-pulse">.</span>
+                                                        <span className="animate-pulse [animation-delay:120ms]">.</span>
+                                                        <span className="animate-pulse [animation-delay:240ms]">.</span>
+                                                    </span>
                                                 </span>
                                             </div>
                                         </div>
                                     </div>
                                 )}
                                 {isSending && agentStatus && streamingContent && (
-                                    <div className="flex justify-start mb-2 pl-10">
-                                        <div className="rounded-xl px-2.5 py-1"
-                                            style={{ background: 'rgba(6,182,212,0.08)', border: '1px solid rgba(6,182,212,0.15)' }}>
-                                            <span className="text-[11px] text-cyan-400/70">{displayedStatus || agentStatus}</span>
+                                    <div className="flex items-center gap-2 text-gray-500 mb-4">
+                                        <div className="bg-[#161616]/70 rounded-xl px-3 py-2 border border-[#262626]">
+                                            <span className="text-xs">
+                                                {displayedStatus || agentStatus}
+                                            </span>
                                         </div>
                                     </div>
                                 )}
@@ -1056,128 +1008,94 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
                             </div>
                         </div>
 
+                        {/* Input (with messages) */}
                         <div className="border-t border-[#262626]/50 bg-[#0a0a0a] px-6 py-4">
                             <div className="max-w-3xl mx-auto space-y-3">
-                                <div className="relative">
-                                    <textarea
-                                        ref={inputRef}
-                                        value={input}
-                                        onChange={(e) => setInput(e.target.value)}
-                                        onKeyDown={handleKeyDown}
-                                        onFocus={() => {
-                                            setShowModelDropdown(false);
-                                            setShowSourcesDropdown(false);
-                                            setShowTimeDropdown(false);
-                                        }}
-                                        placeholder="Ask about your activity..."
-                                        rows={1}
-                                        className="w-full resize-none bg-[#161616] border border-[#333]/70 text-white rounded-xl px-4 py-3 pr-12 text-sm placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-cyan-500/40 focus:border-cyan-500/40"
-                                        style={{ minHeight: '44px', maxHeight: '120px' }}
-                                        onInput={(e) => {
-                                            const t = e.target as HTMLTextAreaElement;
-                                            t.style.height = 'auto';
-                                            t.style.height = `${Math.min(t.scrollHeight, 120)}px`;
-                                        }}
-                                    />
-                                    <button
-                                        onClick={handleSend}
-                                        disabled={!input.trim() || isSending}
-                                        className="absolute right-2 bottom-2 w-8 h-8 flex items-center justify-center rounded-lg text-gray-400 hover:text-cyan-400 disabled:opacity-30 disabled:hover:text-gray-400 transition-colors"
-                                    >
-                                        {isSending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
-                                    </button>
-                                </div>
+                                <textarea
+                                    ref={inputRef}
+                                    value={input}
+                                    onChange={(e) => setInput(e.target.value)}
+                                    onKeyDown={handleKeyDown}
+                                    onFocus={() => {
+                                        setShowModelDropdown(false);
+                                        setShowSourcesDropdown(false);
+                                        setShowTimeDropdown(false);
+                                    }}
+                                    placeholder="Ask about your activity..."
+                                    rows={1}
+                                    className="w-full resize-none bg-[#161616] border border-[#333]/70 text-white rounded-xl px-4 py-3 text-sm placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-cyan-500/40 focus:border-cyan-500/40"
+                                    style={{ minHeight: '44px', maxHeight: '120px' }}
+                                    onInput={(e) => {
+                                        const t = e.target as HTMLTextAreaElement;
+                                        t.style.height = 'auto';
+                                        t.style.height = `${Math.min(t.scrollHeight, 120)}px`;
+                                    }}
+                                />
                                 {controlBar}
                             </div>
                         </div>
                     </>
                 ) : (
                     /* Empty state */
-                    <div className="flex-1 flex flex-col overflow-hidden">
-                        {/* Centered greeting + cards */}
-                        <div className="flex-1 flex flex-col items-center justify-center px-6 py-8 overflow-y-auto">                        <div className="w-full max-w-2xl space-y-6">
-                            <div className="text-center">
-                                {/* Glow orb */}
-                                <div className="relative inline-flex items-center justify-center w-16 h-16 mb-4">
-                                    <div className="absolute inset-0 rounded-full blur-xl opacity-40" style={{ background: 'radial-gradient(circle, #06b6d4 0%, #8b5cf6 100%)' }} />
-                                    <div className="relative w-14 h-14 rounded-2xl flex items-center justify-center"
-                                        style={{ background: 'linear-gradient(135deg, rgba(6,182,212,0.2) 0%, rgba(139,92,246,0.2) 100%)', border: '1px solid rgba(6,182,212,0.3)' }}>
-                                        <BriefcaseBusiness className="w-7 h-7 text-cyan-400" />
-                                    </div>
+                    <div className="flex-1 flex flex-col items-center justify-center px-6 py-8 overflow-y-auto">
+                        <div className="w-full max-w-2xl space-y-5">
+                            <div className="flex justify-center mb-2">
+                                <div className="w-14 h-14 rounded-full border border-[#2a2f35] bg-[#0f1318] flex items-center justify-center">
+                                    <Music2 className="w-5 h-5 text-gray-400" />
                                 </div>
-                                <h2 className="text-3xl font-bold text-white tracking-tight">What would you like to know?</h2>
-                                <p className="text-sm text-gray-500 mt-2">Ask about your activity, get summaries, or explore patterns from your history</p>
                             </div>
 
-                            <div className="grid grid-cols-2 gap-3">
-                                {SUGGESTION_CARDS.map((card, idx) => (
+                            {/* Greeting */}
+                            <div className="text-center mb-2">
+                                <div className="inline-flex items-center justify-center w-12 h-12 rounded-2xl bg-white/5 border border-[#333] mb-3">
+                                    <BriefcaseBusiness className="w-6 h-6 text-cyan-400" />
+                                </div>
+                                <h2 className="text-3xl font-semibold text-white">What would you like to know?</h2>
+                                <p className="text-sm text-gray-400 mt-2">Ask about your activity, get summaries, or start a conversation</p>
+                            </div>
+
+                            {/* Suggestion Cards */}
+                            <div className="grid grid-cols-2 gap-2.5">
+                                {SUGGESTION_CARDS.map((card) => (
                                     <button
                                         key={card.label}
                                         onClick={() => {
                                             setInput(card.prompt);
                                             setTimeout(() => handleSendWithMessage(card.prompt), 50);
                                         }}
-                                        className="group flex items-start gap-3 p-4 rounded-2xl text-left transition-all duration-200 hover:-translate-y-0.5"
-                                        style={{
-                                            background: 'rgba(255,255,255,0.03)',
-                                            border: '1px solid rgba(255,255,255,0.07)',
-                                            animationDelay: `${idx * 60}ms`,
-                                        }}
-                                        onMouseEnter={e => {
-                                            (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.06)';
-                                            (e.currentTarget as HTMLButtonElement).style.borderColor = 'rgba(255,255,255,0.12)';
-                                        }}
-                                        onMouseLeave={e => {
-                                            (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.03)';
-                                            (e.currentTarget as HTMLButtonElement).style.borderColor = 'rgba(255,255,255,0.07)';
-                                        }}
+                                        className={`flex items-start gap-3 p-3.5 rounded-xl border text-left transition-all hover:scale-[1.01] hover:brightness-110 ${card.bg}`}
                                     >
-                                        <div className="w-8 h-8 rounded-xl flex items-center justify-center flex-shrink-0 mt-0.5"
-                                            style={{ background: 'rgba(255,255,255,0.06)' }}>
-                                            <card.icon className={`w-4 h-4 ${card.color}`} />
-                                        </div>
+                                        <card.icon className={`w-4 h-4 mt-0.5 flex-shrink-0 ${card.color}`} />
                                         <div>
-                                            <p className="text-xs font-semibold text-white mb-0.5">{card.label}</p>
-                                            <p className="text-[11px] text-gray-500 leading-relaxed">{card.prompt}</p>
+                                            <p className="text-xs font-semibold text-white">{card.label}</p>
+                                            <p className="text-[11px] text-gray-400 mt-0.5 leading-relaxed">{card.prompt}</p>
                                         </div>
                                     </button>
                                 ))}
                             </div>
-                        </div></div>
-                        {/* Pinned input bar — same structure as messages view so dropdowns open upward */}
-                        <div className="border-t border-[#262626]/50 bg-[#0a0a0a] px-6 py-4 flex-shrink-0">
-                            <div className="max-w-2xl mx-auto space-y-3">
-                                <div className="relative">
-                                    <textarea
-                                        ref={inputRef}
-                                        value={input}
-                                        onChange={(e) => setInput(e.target.value)}
-                                        onKeyDown={handleKeyDown}
-                                        onFocus={() => {
-                                            setShowModelDropdown(false);
-                                            setShowSourcesDropdown(false);
-                                            setShowTimeDropdown(false);
-                                        }}
-                                        placeholder="Ask about moments or topics from your memories..."
-                                        rows={1}
-                                        className="w-full resize-none bg-[#161616] border border-[#333]/70 text-white rounded-xl px-4 py-3 pr-12 text-sm placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-cyan-500/40 focus:border-cyan-500/40"
-                                        style={{ minHeight: '44px', maxHeight: '120px' }}
-                                        onInput={(e) => {
-                                            const t = e.target as HTMLTextAreaElement;
-                                            t.style.height = 'auto';
-                                            t.style.height = `${Math.min(t.scrollHeight, 120)}px`;
-                                        }}
-                                    />
-                                    <button
-                                        onClick={handleSend}
-                                        disabled={!input.trim() || isSending}
-                                        className="absolute right-2 bottom-2 w-8 h-8 flex items-center justify-center rounded-lg text-gray-400 hover:text-cyan-400 disabled:opacity-30 disabled:hover:text-gray-400 transition-colors"
-                                    >
-                                        {isSending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
-                                    </button>
-                                </div>
-                                {controlBar}
-                            </div>
+
+                            {/* Input */}
+                            <textarea
+                                ref={inputRef}
+                                value={input}
+                                onChange={(e) => setInput(e.target.value)}
+                                onKeyDown={handleKeyDown}
+                                onFocus={() => {
+                                    setShowModelDropdown(false);
+                                    setShowSourcesDropdown(false);
+                                    setShowTimeDropdown(false);
+                                }}
+                                placeholder="Ask about moments or topics from your memories..."
+                                rows={1}
+                                className="w-full resize-none bg-[#161616] border border-[#333]/70 text-white rounded-2xl px-5 py-4 text-sm placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-cyan-500/40 focus:border-cyan-500/40"
+                                style={{ minHeight: '52px', maxHeight: '120px' }}
+                                onInput={(e) => {
+                                    const t = e.target as HTMLTextAreaElement;
+                                    t.style.height = 'auto';
+                                    t.style.height = `${Math.min(t.scrollHeight, 120)}px`;
+                                }}
+                            />
+                            {controlBar}
                         </div>
                     </div>
                 )}
@@ -1225,3 +1143,5 @@ export function ChatPage({ initialPrompt }: ChatPageProps) {
         </div>
     );
 }
+
+

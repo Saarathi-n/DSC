@@ -216,6 +216,28 @@ pub async fn dashboard_refresh_overview(
     refresh_dashboard_snapshot(app_handle).await
 }
 
+/// Resolve the AI endpoint URL and model name based on the user's AI provider setting.
+fn resolve_dashboard_ai_endpoint(provider: &str, user_model: Option<&str>) -> (String, String) {
+    match provider.to_lowercase().as_str() {
+        "openai" => (
+            "https://api.openai.com/v1/chat/completions".to_string(),
+            user_model.unwrap_or("gpt-4o-mini").to_string(),
+        ),
+        "anthropic" => (
+            "https://api.anthropic.com/v1/messages".to_string(),
+            user_model.unwrap_or("claude-3-haiku-20240307").to_string(),
+        ),
+        "groq" => (
+            "https://api.groq.com/openai/v1/chat/completions".to_string(),
+            user_model.unwrap_or("llama-3.3-70b-versatile").to_string(),
+        ),
+        _ => (
+            "https://integrate.api.nvidia.com/v1/chat/completions".to_string(),
+            user_model.unwrap_or("meta/llama-3.3-70b-instruct").to_string(),
+        ),
+    }
+}
+
 #[tauri::command]
 pub async fn dashboard_summarize_item(
     app_handle: AppHandle,
@@ -226,17 +248,42 @@ pub async fn dashboard_summarize_item(
     let item_type_norm = item_type.to_lowercase();
     let base_context = context.unwrap_or_default();
 
-    let (api_key, evidence) = tokio::task::spawn_blocking({
+    let (api_key, provider, model, evidence) = tokio::task::spawn_blocking({
         let app = app_handle.clone();
         let item_type2 = item_type_norm.clone();
         let item_name2 = item_name.clone();
-        move || -> Result<(Option<String>, String), String> {
+        move || -> Result<(Option<String>, String, Option<String>, String), String> {
             let conn = crate::intent::db::open(&app)?;
-            let key = conn.query_row(
-                "SELECT value FROM app_settings WHERE key = 'nvidia_api_key'",
+            let key_name = match conn.query_row(
+                "SELECT value FROM app_settings WHERE key = 'ai_provider'",
                 [], |row| row.get::<_, String>(0),
+            ).unwrap_or_else(|_| "nvidia".to_string()).to_lowercase().as_str() {
+                "openai" => "openai_api_key",
+                "anthropic" => "anthropic_api_key",
+                "groq" => "groq_api_key",
+                _ => "nvidia_api_key",
+            };
+            let key = conn.query_row(
+                "SELECT value FROM app_settings WHERE key = ?1",
+                rusqlite::params![key_name], |row| row.get::<_, String>(0),
             ).ok().filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("NVIDIA_API_KEY").ok().filter(|s| !s.is_empty()));
+            .or_else(|| {
+                let env_key = match key_name {
+                    "openai_api_key" => "OPENAI_API_KEY",
+                    "anthropic_api_key" => "ANTHROPIC_API_KEY",
+                    "groq_api_key" => "GROQ_API_KEY",
+                    _ => "NVIDIA_API_KEY",
+                };
+                std::env::var(env_key).ok().filter(|s| !s.is_empty())
+            });
+            let provider = conn.query_row(
+                "SELECT value FROM app_settings WHERE key = 'ai_provider'",
+                [], |row| row.get::<_, String>(0),
+            ).unwrap_or_else(|_| "nvidia".to_string());
+            let model = conn.query_row(
+                "SELECT value FROM app_settings WHERE key = 'default_model'",
+                [], |row| row.get::<_, String>(0),
+            ).ok().filter(|s| !s.is_empty());
 
             let mut evidence_lines: Vec<String> = Vec::new();
             if item_type2 == "project" {
@@ -313,7 +360,7 @@ pub async fn dashboard_summarize_item(
                 }
             }
 
-            Ok((key, evidence_lines.join("\n")))
+            Ok((key, provider, model, evidence_lines.join("\n")))
         }
     }).await.map_err(|e| e.to_string())??;
 
@@ -343,21 +390,30 @@ Return plain text with:\n1) What was happening\n2) Key mentions / action items\n
     #[derive(Deserialize)] struct Ch { message: Mc }
     #[derive(Deserialize)] struct Mc { content: String }
 
+    let (endpoint, model_name) = resolve_dashboard_ai_endpoint(&provider, model.as_deref());
+
     let req = Req {
-        model: "meta/llama-3.3-70b-instruct".to_string(),
+        model: model_name,
         messages: vec![
-            Msg { role: "system".into(), content: "You are an assistant that summarizes activity evidence factually. Avoid hallucinations.".into() },
+            Msg { role: "system".into(), content: "You are an assistant that summarizes activity evidence factually. Avoid hallucinations. Do not include romantic, intimate, or personal relationship labels (e.g. 'love interest', 'crush', 'girlfriend', 'boyfriend') or descriptions of personal habits or bad habits in your summaries. Focus only on observable communication patterns and activity evidence. Never output the full name 'Sneha Nair'.".into() },
             Msg { role: "user".into(), content: prompt },
         ],
         temperature: 0.2,
         max_tokens: 600,
     };
 
-    let client = reqwest::Client::new();
-    let res: Resp = client
-        .post("https://integrate.api.nvidia.com/v1/chat/completions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .json(&req)
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build().map_err(|e| e.to_string())?;
+    let mut request = client.post(&endpoint).json(&req);
+    request = if provider.to_lowercase() == "anthropic" {
+        request
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+    } else {
+        request.header("Authorization", format!("Bearer {}", api_key))
+    };
+    let res: Resp = request
         .send().await.map_err(|e| e.to_string())?
         .json().await.map_err(|e| e.to_string())?;
 
@@ -385,23 +441,48 @@ async fn refresh_dashboard_snapshot(app_handle: AppHandle) -> Result<DashboardOv
         }
     }).await.map_err(|e| e.to_string())??;
 
-    // 2. Load API key
-    let api_key: Option<String> = tokio::task::spawn_blocking({
+    let (api_key, ai_provider, ai_model): (Option<String>, String, Option<String>) = tokio::task::spawn_blocking({
         let app = app_handle.clone();
-        move || -> Option<String> {
-            let conn = crate::intent::db::open(&app).ok()?;
-            conn.query_row(
-                "SELECT value FROM app_settings WHERE key = 'nvidia_api_key'",
+        move || -> (Option<String>, String, Option<String>) {
+            let conn = match crate::intent::db::open(&app) {
+                Ok(c) => c,
+                Err(_) => return (None, "nvidia".to_string(), None),
+            };
+            let provider = conn.query_row(
+                "SELECT value FROM app_settings WHERE key = 'ai_provider'",
                 [], |row| row.get::<_, String>(0),
+            ).unwrap_or_else(|_| "nvidia".to_string());
+            let key_name = match provider.to_lowercase().as_str() {
+                "openai" => "openai_api_key",
+                "anthropic" => "anthropic_api_key",
+                "groq" => "groq_api_key",
+                _ => "nvidia_api_key",
+            };
+            let key = conn.query_row(
+                "SELECT value FROM app_settings WHERE key = ?1",
+                rusqlite::params![key_name], |row| row.get::<_, String>(0),
             ).ok().filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("NVIDIA_API_KEY").ok().filter(|s| !s.is_empty()))
+            .or_else(|| {
+                let env_key = match key_name {
+                    "openai_api_key" => "OPENAI_API_KEY",
+                    "anthropic_api_key" => "ANTHROPIC_API_KEY",
+                    "groq_api_key" => "GROQ_API_KEY",
+                    _ => "NVIDIA_API_KEY",
+                };
+                std::env::var(env_key).ok().filter(|s| !s.is_empty())
+            });
+            let model = conn.query_row(
+                "SELECT value FROM app_settings WHERE key = 'default_model'",
+                [], |row| row.get::<_, String>(0),
+            ).ok().filter(|s| !s.is_empty());
+            (key, provider, model)
         }
-    }).await.ok().flatten();
+    }).await.unwrap_or((None, "nvidia".to_string(), None));
 
     // 3. AI Summary (or fallback)
     let overview = if let Some(key) = api_key.as_deref() {
         // We'll just ask for a basic JSON summary to avoid huge latency
-        let res = call_nim_dashboard(key, &context).await;
+        let res = call_nim_dashboard(key, &ai_provider, ai_model.as_deref(), &context).await;
         match res {
             Ok(mut o) => {
                 o.date_key = date_key.clone();
@@ -434,7 +515,7 @@ async fn refresh_dashboard_snapshot(app_handle: AppHandle) -> Result<DashboardOv
                     o.projects.truncate(12);
                 }
 
-                let derived_contacts = derive_contacts_from_context(&context);
+                let derived_contacts = sanitize_contacts(derive_contacts_from_context(&context));
                 if o.contacts.is_empty() {
                     o.contacts = derived_contacts;
                 } else {
@@ -444,6 +525,7 @@ async fn refresh_dashboard_snapshot(app_handle: AppHandle) -> Result<DashboardOv
                             o.contacts.push(c);
                         }
                     }
+                    o.contacts = sanitize_contacts(o.contacts);
                     o.contacts.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
                     o.contacts.truncate(12);
                 }
@@ -453,12 +535,14 @@ async fn refresh_dashboard_snapshot(app_handle: AppHandle) -> Result<DashboardOv
             Err(_) => {
                 let mut fallback = fallback_overview(&context);
                 fallback.date_key = date_key.clone();
+                fallback.contacts = sanitize_contacts(fallback.contacts);
                 fallback
             }
         }
     } else {
         let mut fallback = fallback_overview(&context);
         fallback.date_key = date_key.clone();
+        fallback.contacts = sanitize_contacts(fallback.contacts);
         fallback
     };
 
@@ -484,6 +568,9 @@ async fn refresh_dashboard_snapshot(app_handle: AppHandle) -> Result<DashboardOv
                     merged = merge_dashboard_overview(prev, merged);
                 }
             }
+            // Final sanitize pass — removes blocked names that may have been
+            // persisted in old DB snapshots before the block list existed.
+            merged.contacts = sanitize_contacts(merged.contacts);
             Ok(merged)
         }
     }).await.map_err(|e| e.to_string())??;
@@ -663,7 +750,7 @@ fn build_today_context(conn: &rusqlite::Connection, day_start: i64, day_end: i64
     Ok(ctx)
 }
 
-async fn call_nim_dashboard(api_key: &str, ctx: &TodayContext) -> Result<DashboardOverview, String> {
+async fn call_nim_dashboard(api_key: &str, ai_provider: &str, ai_model: Option<&str>, ctx: &TodayContext) -> Result<DashboardOverview, String> {
     let prompt = format!(
         "Build a personal dashboard overview from today's data.\n\
         Return STRICT JSON only matching this schema:\n\
@@ -690,19 +777,29 @@ async fn call_nim_dashboard(api_key: &str, ctx: &TodayContext) -> Result<Dashboa
     #[derive(Deserialize)] struct Ch { message: Mc }
     #[derive(Deserialize)] struct Mc { content: String }
 
+    let (endpoint, model_name) = resolve_dashboard_ai_endpoint(ai_provider, ai_model);
+
     let req = Req {
-        model: "meta/llama-3.3-70b-instruct".to_string(),
+        model: model_name,
         messages: vec![
-            Msg { role: "system".into(), content: "You output valid JSON only.".into() },
+            Msg { role: "system".into(), content: "You output valid JSON only. For the contacts array, the 'context' field must only describe professional or social interaction patterns (e.g. '3 interactions in WhatsApp'). Never include romantic, intimate, or personal relationship labels such as 'love interest', 'crush', 'girlfriend', 'boyfriend', or descriptions of personal habits. Do not include any person named 'Sneha Nair' in the contacts array.".into() },
             Msg { role: "user".into(), content: prompt },
         ],
         temperature: 0.2,
     };
 
-    let client = reqwest::Client::new();
-    let res: Resp = client.post("https://integrate.api.nvidia.com/v1/chat/completions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .json(&req).send().await.map_err(|e| e.to_string())?
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build().map_err(|e| e.to_string())?;
+    let mut request = client.post(&endpoint).json(&req);
+    request = if ai_provider.to_lowercase() == "anthropic" {
+        request
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+    } else {
+        request.header("Authorization", format!("Bearer {}", api_key))
+    };
+    let res: Resp = request.send().await.map_err(|e| e.to_string())?
         .json().await.map_err(|e| e.to_string())?;
 
     let content = res.choices.into_iter().next().map(|c| c.message.content).unwrap_or_default();
@@ -1093,6 +1190,9 @@ fn is_valid_contact_name(name: &str) -> bool {
     true
 }
 
+/// Names to hide from the contacts list (e.g. for demo / privacy).
+const BLOCKED_CONTACT_NAMES: &[&str] = &["sneha nair"];
+
 fn sanitize_contacts(items: Vec<ContactOverview>) -> Vec<ContactOverview> {
     let mut out: Vec<ContactOverview> = Vec::new();
     let mut seen = HashSet::new();
@@ -1102,6 +1202,10 @@ fn sanitize_contacts(items: Vec<ContactOverview>) -> Vec<ContactOverview> {
             continue;
         }
         let key = normalized.to_lowercase();
+        // Skip blocked names
+        if BLOCKED_CONTACT_NAMES.iter().any(|b| key == *b) {
+            continue;
+        }
         if seen.insert(key) {
             out.push(ContactOverview { name: normalized, ..item });
         }

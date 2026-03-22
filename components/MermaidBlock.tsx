@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import mermaid from 'mermaid';
+import DOMPurify from 'dompurify';
 
 let mermaidInitialized = false;
 
@@ -73,7 +74,7 @@ const MermaidBlockInner: React.FC<MermaidBlockProps> = ({ chart }) => {
   return (
     <div
       className="my-3 overflow-x-auto rounded-lg border border-[#333] bg-[#111] p-2 [&>svg]:h-auto [&>svg]:max-w-full"
-      dangerouslySetInnerHTML={{ __html: svg }}
+      dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(svg, { USE_PROFILES: { svg: true, svgFilters: true }, ADD_TAGS: ['foreignObject'] }) }}
     />
   );
 };
