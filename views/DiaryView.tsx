@@ -9,6 +9,7 @@ interface DiaryEntry {
     content: string;
     isAiGenerated: boolean;
     createdAt: number;
+    updatedAt: number;
 }
 
 function todayStr() {
@@ -30,6 +31,7 @@ export const DiaryView: React.FC = () => {
     const [activeDate, setActiveDate] = useState(todayStr());
     const [entries, setEntries] = useState<DiaryEntry[]>([]);
     const [yesterdaySummary, setYesterdaySummary] = useState<DiaryEntry | null>(null);
+    const [yesterdaySummaryError, setYesterdaySummaryError] = useState<string | null>(null);
     const [editingId, setEditingId] = useState<string | null>(null);
     const [editContent, setEditContent] = useState('');
     const [newContent, setNewContent] = useState('');
@@ -58,6 +60,7 @@ export const DiaryView: React.FC = () => {
                             content: '*(This is a sample AI-generated diary entry. Connect the backend to load your real activity-based diary.)*\n\nToday was productive. You spent most of your morning in VS Code working on the Allentire project — specifically implementing the ChatView and ActivityView components. In the afternoon you explored the IntentFlow architecture documentation. Lofi Hip Hop played in the background for about 2 hours.',
                             isAiGenerated: true,
                             createdAt: Date.now() / 1000,
+                            updatedAt: Date.now() / 1000,
                         }]);
                     }
                 }
@@ -85,23 +88,38 @@ export const DiaryView: React.FC = () => {
 
     const handleGenerateYesterdaySummary = async () => {
         setIsGeneratingYesterday(true);
+        setYesterdaySummaryError(null);
         try {
             if (window.nexusAPI?.diary) {
                 const content = await window.nexusAPI.diary.generateEntry(yesterdayDate);
+                const now = Date.now() / 1000;
                 const generated: DiaryEntry = {
                     id: `ai-yesterday-${Date.now()}`,
                     date: yesterdayDate,
                     content,
                     isAiGenerated: true,
-                    createdAt: Date.now() / 1000,
+                    createdAt: now,
+                    updatedAt: now,
                 };
-                const saved = await window.nexusAPI.diary.saveEntry(generated);
-                setYesterdaySummary(saved);
-                if (activeDate === yesterdayDate) {
-                    setEntries(p => [saved, ...p.filter(e => e.id !== saved.id)]);
+                try {
+                    const saved = await window.nexusAPI.diary.saveEntry(generated);
+                    setYesterdaySummary(saved);
+                    if (activeDate === yesterdayDate) {
+                        setEntries(p => [saved, ...p.filter(e => e.id !== saved.id)]);
+                    }
+                } catch {
+                    setYesterdaySummary(generated);
+                    if (activeDate === yesterdayDate) {
+                        setEntries(p => [generated, ...p.filter(e => e.id !== generated.id)]);
+                    }
                 }
+            } else {
+                setYesterdaySummaryError('Diary backend is unavailable in this runtime.');
             }
-        } catch { /* offline */ }
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Failed to generate summary.';
+            setYesterdaySummaryError(message);
+        }
         setIsGeneratingYesterday(false);
     };
 
@@ -110,7 +128,7 @@ export const DiaryView: React.FC = () => {
         setIsSavingManual(true);
         const entry: DiaryEntry = {
             id: `manual-${Date.now()}`, date: activeDate, content: newContent.trim(),
-            isAiGenerated: false, createdAt: Date.now() / 1000,
+            isAiGenerated: false, createdAt: Date.now() / 1000, updatedAt: Date.now() / 1000,
         };
         try {
             if (window.nexusAPI?.diary) {
@@ -128,11 +146,12 @@ export const DiaryView: React.FC = () => {
 
     const handleSaveEdit = async () => {
         if (!editingId) return;
-        setEntries(p => p.map(e => e.id === editingId ? { ...e, content: editContent } : e));
+        const now = Date.now() / 1000;
+        setEntries(p => p.map(e => e.id === editingId ? { ...e, content: editContent, updatedAt: now } : e));
         try {
             const entry = entries.find(e => e.id === editingId);
             if (entry && window.nexusAPI?.diary) {
-                await window.nexusAPI.diary.saveEntry({ ...entry, content: editContent });
+                await window.nexusAPI.diary.saveEntry({ ...entry, content: editContent, updatedAt: now });
             }
         } catch { /* offline */ }
         setEditingId(null);
@@ -203,6 +222,9 @@ export const DiaryView: React.FC = () => {
                         </div>
                     ) : (
                         <p className="text-sm text-gray-500">No AI summary yet for yesterday. Click “Generate Summary”.</p>
+                    )}
+                    {yesterdaySummaryError && (
+                        <p className="text-xs text-red-400 mt-3">{yesterdaySummaryError}</p>
                     )}
                 </div>
 
