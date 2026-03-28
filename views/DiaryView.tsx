@@ -35,6 +35,7 @@ export const DiaryView: React.FC = () => {
     const [newContent, setNewContent] = useState('');
     const [isSavingManual, setIsSavingManual] = useState(false);
     const [isGeneratingYesterday, setIsGeneratingYesterday] = useState(false);
+    const [generateError, setGenerateError] = useState<string | null>(null);
     const textRef = useRef<HTMLTextAreaElement>(null);
 
     const currentDateEntries = entries.filter(e => e.date === activeDate);
@@ -85,6 +86,7 @@ export const DiaryView: React.FC = () => {
 
     const handleGenerateYesterdaySummary = async () => {
         setIsGeneratingYesterday(true);
+        setGenerateError(null);
         try {
             if (window.nexusAPI?.diary) {
                 const content = await window.nexusAPI.diary.generateEntry(yesterdayDate);
@@ -93,7 +95,7 @@ export const DiaryView: React.FC = () => {
                     date: yesterdayDate,
                     content,
                     isAiGenerated: true,
-                    createdAt: Date.now() / 1000,
+                    createdAt: Math.floor(Date.now() / 1000),
                 };
                 const saved = await window.nexusAPI.diary.saveEntry(generated);
                 setYesterdaySummary(saved);
@@ -101,7 +103,12 @@ export const DiaryView: React.FC = () => {
                     setEntries(p => [saved, ...p.filter(e => e.id !== saved.id)]);
                 }
             }
-        } catch { /* offline */ }
+        } catch (error: any) {
+            const message = typeof error === 'string'
+                ? error
+                : (error?.message || 'Failed to generate diary summary. Please check AI settings and network.');
+            setGenerateError(message);
+        }
         setIsGeneratingYesterday(false);
     };
 
@@ -110,7 +117,7 @@ export const DiaryView: React.FC = () => {
         setIsSavingManual(true);
         const entry: DiaryEntry = {
             id: `manual-${Date.now()}`, date: activeDate, content: newContent.trim(),
-            isAiGenerated: false, createdAt: Date.now() / 1000,
+            isAiGenerated: false, createdAt: Math.floor(Date.now() / 1000),
         };
         try {
             if (window.nexusAPI?.diary) {
@@ -151,7 +158,6 @@ export const DiaryView: React.FC = () => {
                     <h1 className="text-2xl font-bold text-white tracking-tight">Diary</h1>
                     <p className="text-xs text-gray-500">Personal dashboard + AI reflections + manual notes</p>
                 </div>
-
 
             </div>
 
@@ -203,6 +209,12 @@ export const DiaryView: React.FC = () => {
                         </div>
                     ) : (
                         <p className="text-sm text-gray-500">No AI summary yet for yesterday. Click “Generate Summary”.</p>
+                    )}
+
+                    {generateError && (
+                        <p className="mt-3 text-xs text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">
+                            {generateError}
+                        </p>
                     )}
                 </div>
 

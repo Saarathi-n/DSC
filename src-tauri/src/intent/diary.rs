@@ -157,7 +157,7 @@ pub async fn diary_generate_entry(
     model: Option<String>,
 ) -> Result<String, String> {
     // Phase 1: sync DB — collect all data into owned Strings, then conn is dropped
-    let (apps, api_key, db_model, _ai_provider) = tokio::task::spawn_blocking({
+    let (apps, api_key, db_model, ai_provider) = tokio::task::spawn_blocking({
         let app2 = app_handle.clone();
         let date2 = date.clone();
         move || -> Result<(Vec<String>, Option<String>, String, String), String> {
@@ -173,11 +173,18 @@ pub async fn diary_generate_entry(
     };
 
     // Phase 2: async API call (no Connection held)
-    // Use explicit model > db model > fallback
+    let provider = ai_provider.to_lowercase();
+
+    // Use explicit model > db model > provider-specific fallback
     let model_id = model.as_deref()
         .filter(|s| !s.is_empty())
         .or_else(|| if db_model.is_empty() { None } else { Some(db_model.as_str()) })
-        .unwrap_or("meta/llama-3.3-70b-instruct");
+        .unwrap_or(match provider.as_str() {
+            "openai" => "gpt-4o-mini",
+            "groq" => "llama-3.1-8b-instant",
+            "anthropic" => "claude-3-5-sonnet-latest",
+            _ => "meta/llama-3.3-70b-instruct",
+        });
 
     let Some(key) = api_key else {
         return Ok(format!(
@@ -198,7 +205,7 @@ pub async fn diary_generate_entry(
     #[derive(Deserialize)] struct Ch   { message: Mc }
     #[derive(Deserialize)] struct Mc   { content: String }
 
-    let try_provider = |ep: String, key: String, model_id: String, prompt: String| async move {
+    let try_openai_compatible = |ep: String, key: String, model_id: String, prompt: String| async move {
         let resp = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build().map_err(|e| e.to_string())?
@@ -224,14 +231,92 @@ pub async fn diary_generate_entry(
             .ok_or_else(|| "Empty diary generation response".to_string())
     };
 
-    let first = try_provider(
-        "https://integrate.api.nvidia.com/v1/chat/completions".to_string(),
-        key,
-        model_id.to_string(),
-        prompt.clone(),
-    ).await;
+    #[derive(Serialize)]
+    struct AnthropicReq {
+        model: String,
+        max_tokens: u32,
+        temperature: f32,
+        messages: Vec<AnthropicMsg>,
+    }
+
+    #[derive(Serialize)]
+    struct AnthropicMsg {
+        role: &'static str,
+        content: String,
+    }
+
+    #[derive(Deserialize)]
+    struct AnthropicResp {
+        content: Vec<AnthropicContent>,
+    }
+
+    #[derive(Deserialize)]
+    struct AnthropicContent {
+        #[serde(rename = "type")]
+        kind: String,
+        text: Option<String>,
+    }
+
+    let try_anthropic = |key: String, model_id: String, prompt: String| async move {
+        let resp = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build().map_err(|e| e.to_string())?
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&AnthropicReq {
+                model: model_id,
+                max_tokens: 512,
+                temperature: 0.85,
+                messages: vec![AnthropicMsg { role: "user", content: prompt }],
+            })
+            .send().await.map_err(|e| e.to_string())?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("AI {} — {}", status, &text[..text.len().min(300)]));
+        }
+
+        let parsed: AnthropicResp = resp.json().await.map_err(|e| e.to_string())?;
+        parsed
+            .content
+            .into_iter()
+            .find(|c| c.kind == "text")
+            .and_then(|c| c.text)
+            .ok_or_else(|| "Empty diary generation response".to_string())
+    };
+
+    let first = match provider.as_str() {
+        "openai" => {
+            try_openai_compatible(
+                "https://api.openai.com/v1/chat/completions".to_string(),
+                key,
+                model_id.to_string(),
+                prompt.clone(),
+            ).await
+        }
+        "groq" => {
+            try_openai_compatible(
+                "https://api.groq.com/openai/v1/chat/completions".to_string(),
+                key,
+                model_id.to_string(),
+                prompt.clone(),
+            ).await
+        }
+        "anthropic" => try_anthropic(key, model_id.to_string(), prompt.clone()).await,
+        _ => {
+            try_openai_compatible(
+                "https://integrate.api.nvidia.com/v1/chat/completions".to_string(),
+                key,
+                model_id.to_string(),
+                prompt.clone(),
+            ).await
+        }
+    };
+
     match first {
         Ok(text) => Ok(text),
-        Err(first_err) => Err(first_err),
+        Err(first_err) => Err(format!("Diary generation failed via {} provider: {}", provider, first_err)),
     }
 }
