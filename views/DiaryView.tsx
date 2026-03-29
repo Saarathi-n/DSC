@@ -60,8 +60,8 @@ export const DiaryView: React.FC = () => {
                             date: todayStr(),
                             content: '*(This is a sample AI-generated diary entry. Connect the backend to load your real activity-based diary.)*\n\nToday was productive. You spent most of your morning in VS Code working on the Allentire project — specifically implementing the ChatView and ActivityView components. In the afternoon you explored the IntentFlow architecture documentation. Lofi Hip Hop played in the background for about 2 hours.',
                             isAiGenerated: true,
-                            createdAt: now,
-                            updatedAt: now,
+                            createdAt: Date.now() / 1000,
+                            updatedAt: Date.now() / 1000,
                         }]);
                     }
                 }
@@ -93,7 +93,7 @@ export const DiaryView: React.FC = () => {
         try {
             if (window.nexusAPI?.diary) {
                 const content = await window.nexusAPI.diary.generateEntry(yesterdayDate);
-                const now = Math.floor(Date.now() / 1000);
+                const now = Date.now() / 1000;
                 const generated: DiaryEntry = {
                     id: `ai-yesterday-${Date.now()}`,
                     date: yesterdayDate,
@@ -130,7 +130,7 @@ export const DiaryView: React.FC = () => {
         const now = Math.floor(Date.now() / 1000);
         const entry: DiaryEntry = {
             id: `manual-${Date.now()}`, date: activeDate, content: newContent.trim(),
-            isAiGenerated: false, createdAt: now, updatedAt: now,
+            isAiGenerated: false, createdAt: Date.now() / 1000, updatedAt: Date.now() / 1000,
         };
         try {
             if (window.nexusAPI?.diary) {
@@ -148,7 +148,7 @@ export const DiaryView: React.FC = () => {
 
     const handleSaveEdit = async () => {
         if (!editingId) return;
-        const now = Math.floor(Date.now() / 1000);
+        const now = Date.now() / 1000;
         setEntries(p => p.map(e => e.id === editingId ? { ...e, content: editContent, updatedAt: now } : e));
         try {
             const entry = entries.find(e => e.id === editingId);
