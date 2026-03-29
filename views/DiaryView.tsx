@@ -9,6 +9,7 @@ interface DiaryEntry {
     content: string;
     isAiGenerated: boolean;
     createdAt: number;
+    updatedAt: number;
 }
 
 function todayStr() {
@@ -30,12 +31,12 @@ export const DiaryView: React.FC = () => {
     const [activeDate, setActiveDate] = useState(todayStr());
     const [entries, setEntries] = useState<DiaryEntry[]>([]);
     const [yesterdaySummary, setYesterdaySummary] = useState<DiaryEntry | null>(null);
+    const [yesterdaySummaryError, setYesterdaySummaryError] = useState<string | null>(null);
     const [editingId, setEditingId] = useState<string | null>(null);
     const [editContent, setEditContent] = useState('');
     const [newContent, setNewContent] = useState('');
     const [isSavingManual, setIsSavingManual] = useState(false);
     const [isGeneratingYesterday, setIsGeneratingYesterday] = useState(false);
-    const [generateError, setGenerateError] = useState<string | null>(null);
     const textRef = useRef<HTMLTextAreaElement>(null);
 
     const currentDateEntries = entries.filter(e => e.date === activeDate);
@@ -53,12 +54,14 @@ export const DiaryView: React.FC = () => {
                 } else {
                     // Stub offline preview
                     if (activeDate === todayStr() && entries.length === 0) {
+                        const now = Math.floor(Date.now() / 1000);
                         setEntries([{
                             id: 'stub-1',
                             date: todayStr(),
                             content: '*(This is a sample AI-generated diary entry. Connect the backend to load your real activity-based diary.)*\n\nToday was productive. You spent most of your morning in VS Code working on the Allentire project — specifically implementing the ChatView and ActivityView components. In the afternoon you explored the IntentFlow architecture documentation. Lofi Hip Hop played in the background for about 2 hours.',
                             isAiGenerated: true,
-                            createdAt: Date.now() / 1000,
+                            createdAt: now,
+                            updatedAt: now,
                         }]);
                     }
                 }
@@ -86,28 +89,37 @@ export const DiaryView: React.FC = () => {
 
     const handleGenerateYesterdaySummary = async () => {
         setIsGeneratingYesterday(true);
-        setGenerateError(null);
+        setYesterdaySummaryError(null);
         try {
             if (window.nexusAPI?.diary) {
                 const content = await window.nexusAPI.diary.generateEntry(yesterdayDate);
+                const now = Math.floor(Date.now() / 1000);
                 const generated: DiaryEntry = {
                     id: `ai-yesterday-${Date.now()}`,
                     date: yesterdayDate,
                     content,
                     isAiGenerated: true,
-                    createdAt: Math.floor(Date.now() / 1000),
+                    createdAt: now,
+                    updatedAt: now,
                 };
-                const saved = await window.nexusAPI.diary.saveEntry(generated);
-                setYesterdaySummary(saved);
-                if (activeDate === yesterdayDate) {
-                    setEntries(p => [saved, ...p.filter(e => e.id !== saved.id)]);
+                try {
+                    const saved = await window.nexusAPI.diary.saveEntry(generated);
+                    setYesterdaySummary(saved);
+                    if (activeDate === yesterdayDate) {
+                        setEntries(p => [saved, ...p.filter(e => e.id !== saved.id)]);
+                    }
+                } catch {
+                    setYesterdaySummary(generated);
+                    if (activeDate === yesterdayDate) {
+                        setEntries(p => [generated, ...p.filter(e => e.id !== generated.id)]);
+                    }
                 }
+            } else {
+                setYesterdaySummaryError('Diary backend is unavailable in this runtime.');
             }
-        } catch (error: any) {
-            const message = typeof error === 'string'
-                ? error
-                : (error?.message || 'Failed to generate diary summary. Please check AI settings and network.');
-            setGenerateError(message);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Failed to generate summary.';
+            setYesterdaySummaryError(message);
         }
         setIsGeneratingYesterday(false);
     };
@@ -115,9 +127,10 @@ export const DiaryView: React.FC = () => {
     const handleAddManual = async () => {
         if (!newContent.trim()) return;
         setIsSavingManual(true);
+        const now = Math.floor(Date.now() / 1000);
         const entry: DiaryEntry = {
             id: `manual-${Date.now()}`, date: activeDate, content: newContent.trim(),
-            isAiGenerated: false, createdAt: Math.floor(Date.now() / 1000),
+            isAiGenerated: false, createdAt: now, updatedAt: now,
         };
         try {
             if (window.nexusAPI?.diary) {
@@ -135,11 +148,12 @@ export const DiaryView: React.FC = () => {
 
     const handleSaveEdit = async () => {
         if (!editingId) return;
-        setEntries(p => p.map(e => e.id === editingId ? { ...e, content: editContent } : e));
+        const now = Math.floor(Date.now() / 1000);
+        setEntries(p => p.map(e => e.id === editingId ? { ...e, content: editContent, updatedAt: now } : e));
         try {
             const entry = entries.find(e => e.id === editingId);
             if (entry && window.nexusAPI?.diary) {
-                await window.nexusAPI.diary.saveEntry({ ...entry, content: editContent });
+                await window.nexusAPI.diary.saveEntry({ ...entry, content: editContent, updatedAt: now });
             }
         } catch { /* offline */ }
         setEditingId(null);
@@ -158,6 +172,7 @@ export const DiaryView: React.FC = () => {
                     <h1 className="text-2xl font-bold text-white tracking-tight">Diary</h1>
                     <p className="text-xs text-gray-500">Personal dashboard + AI reflections + manual notes</p>
                 </div>
+
 
             </div>
 
@@ -210,11 +225,8 @@ export const DiaryView: React.FC = () => {
                     ) : (
                         <p className="text-sm text-gray-500">No AI summary yet for yesterday. Click “Generate Summary”.</p>
                     )}
-
-                    {generateError && (
-                        <p className="mt-3 text-xs text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">
-                            {generateError}
-                        </p>
+                    {yesterdaySummaryError && (
+                        <p className="text-xs text-red-400 mt-3">{yesterdaySummaryError}</p>
                     )}
                 </div>
 
